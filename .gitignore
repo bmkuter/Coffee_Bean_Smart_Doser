@@ -31,3 +31,5 @@ sdkconfig.defaults.esp32s3
 sdkconfig.old
 
 pytest_blink.py
+
+debug.log
