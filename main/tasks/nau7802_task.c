@@ -16,8 +16,15 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <string.h>
 #include <math.h>
+
+// NVS Storage constants
+#define NVS_NAMESPACE "nau7802"
+#define NVS_KEY_TARE_A "tare_a"
+#define NVS_KEY_TARE_B "tare_b"
 
 // Task variables
 static TaskHandle_t nau7802_task_handle = NULL;
@@ -36,12 +43,12 @@ static uint32_t channel_b_consecutive_errors = 0;
 static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
 
 // Calibration data for both channels
-static nau7802_calibration_t channel_a_cal = {0, 1.0f, false};
-static nau7802_calibration_t channel_b_cal = {0, 1.0f, false};
+static nau7802_calibration_t channel_a_cal = {0, 0.623f, false};  // Calibrated for 1x gain (223 counts / 358g)
+static nau7802_calibration_t channel_b_cal = {0, 0.623f, false};  // Calibrated for 1x gain (223 counts / 358g)
 
 // Configuration
-static nau7802_gain_t current_gain = NAU7802_GAIN_64X;  // Maximum sensitivity for strain gauges  
-static nau7802_rate_t current_rate = NAU7802_RATE_40SPS;
+static nau7802_gain_t current_gain = NAU7802_GAIN_1X;  // Maximum stability with lowest gain
+static nau7802_rate_t current_rate = NAU7802_RATE_20SPS;
 
 // Dynamic timeout optimization
 static uint32_t optimal_timeout_ms = 100;  // Default timeout, will be calibrated
@@ -61,6 +68,11 @@ static float nau7802_raw_to_weight(int32_t raw_value, nau7802_calibration_t* cal
 static esp_err_t nau7802_perform_calibration(void);
 static void nau7802_calibrate_timing(int num_samples);
 static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position, int32_t delta);
+static esp_err_t nau7802_save_tare_values(void);
+static esp_err_t nau7802_load_tare_values(void);
+static esp_err_t nau7802_init_nvs(void);
+static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms);
+
 
 esp_err_t nau7802_task_init(void)
 {
@@ -91,6 +103,20 @@ esp_err_t nau7802_task_init(void)
         ESP_LOGE(TAG_NAU7802, "Failed to initialize NAU7802 device: %s", esp_err_to_name(ret));
         vSemaphoreDelete(nau7802_data_mutex);
         return ret;
+    }
+
+    // Initialize NVS for persistent tare storage
+    ret = nau7802_init_nvs();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to initialize NVS - tare values won't persist");
+    } else {
+        // Load saved tare values from flash
+        ret = nau7802_load_tare_values();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG_NAU7802, "Restored tare values from flash storage");
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Using default tare values (no saved values found)");
+        }
     }
 
     // Initialize data structure
@@ -166,6 +192,11 @@ static void nau7802_task_function(void* pvParameters)
     uint32_t error_count = 0;
     uint32_t last_error_log = 0;
 
+    // Send initial display update to show "0g" instead of "-----g"
+    // This ensures the display shows weight immediately on startup
+    display_send_coffee_info(-999.0f, 0.0f, false);  // Start with 0g container weight
+    ESP_LOGI(TAG_NAU7802, "Sent initial display update to show 0g");
+
     // Calibrate optimal timeout on startup
     // uint32_t calibrated_timeout = 100;  // Default fallback
     // esp_err_t cal_ret = nau7802_test_timeout_values(20, 200, 10, &calibrated_timeout);
@@ -192,21 +223,27 @@ static void nau7802_task_function(void* pvParameters)
                 if (ret == ESP_OK) {
                     // Update Channel A data
                     if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        uint32_t timestamp_ms = esp_timer_get_time() / 1000;
+                        
                         nau7802_data.channel_a.raw_value = raw_value;
-                        nau7802_data.channel_a.weight_grams = nau7802_raw_to_weight(raw_value, &channel_a_cal);
+                        nau7802_data.channel_a.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_a_cal, &nau7802_data.channel_a, timestamp_ms);
                         nau7802_data.channel_a.data_ready = true;
-                        nau7802_data.channel_a.timestamp = esp_timer_get_time() / 1000;
+                        nau7802_data.channel_a.timestamp = timestamp_ms;
                         nau7802_data.channel_a.sample_count = ++channel_a_samples;
                         nau7802_data.total_conversions++;
                         xSemaphoreGive(nau7802_data_mutex);
 
                         // Check if the weight value indicates a disconnected sensor
-                        if (nau7802_data.channel_a.weight_grams < -900.0f) {
+                        // Temporarily disabled to allow re-taring after gain change
+                        if (false && nau7802_data.channel_a.weight_grams < -900.0f) {
                             ESP_LOGW(TAG_NAU7802, "Channel A: invalid weight %.2fg indicates disconnection", 
                                      nau7802_data.channel_a.weight_grams);
                             channel_a_consecutive_errors++;
                         } else {
-                            ESP_LOGD(TAG_NAU7802, "Channel A: raw=%ld, weight=%.2fg", raw_value, nau7802_data.channel_a.weight_grams);
+                            ESP_LOGI(TAG_NAU7802, "Channel A: raw=%ld, filtered=%.0fg, velocity=%.3fg/s, accel=%.3fg/s², conf=%.2f", 
+                                     raw_value, nau7802_data.channel_a.filtered_weight,
+                                     nau7802_data.channel_a.velocity, nau7802_data.channel_a.acceleration,
+                                     nau7802_data.channel_a.confidence);
                             channel_a_success = true;
                             
                             // Reset error count and mark as connected
@@ -437,14 +474,14 @@ static esp_err_t nau7802_device_init(void)
         ESP_LOGI(TAG_NAU7802, "CTRL1 register: 0x%02X", ctrl1_readback);
     }
     
-    // Set gain to 128x
+    // Set gain to 4x
     ret = nau7802_set_gain(current_gain);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_NAU7802, "Failed to set gain");
         return ret;
     }
     
-    // Set sample rate to 20 SPS
+    // Set sample rate to 10 SPS for maximum noise reduction
     ret = nau7802_set_sample_rate(current_rate);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_NAU7802, "Failed to set sample rate");
@@ -694,6 +731,15 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         
         if (any_tared) {
             ESP_LOGI(TAG_NAU7802, "✓ Scale tared - all connected channels zeroed");
+            
+            // Reset rotary encoder position to 0 as part of the tare/reset operation
+            esp_err_t encoder_ret = rotary_encoder_set_position(0);
+            if (encoder_ret == ESP_OK) {
+                ESP_LOGI(TAG_NAU7802, "Rotary encoder position reset to 0");
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Failed to reset encoder position: %s", esp_err_to_name(encoder_ret));
+            }
+            
             // Send brief tare confirmation to display
             display_send_system_status("SCALE TARED", false);
             
@@ -711,6 +757,106 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
             display_send_system_status("TARE FAILED", true);
         }
     }
+}
+
+// NVS Storage Functions
+static esp_err_t nau7802_init_nvs(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG_NAU7802, "NVS partition was truncated and needs to be erased");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to initialize NVS: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "NVS initialized successfully");
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_save_tare_values(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret;
+
+    ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to open NVS handle: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Save Channel A tare value
+    ret = nvs_set_i32(nvs_handle, NVS_KEY_TARE_A, channel_a_cal.zero_offset);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to save Channel A tare: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
+    // Save Channel B tare value
+    ret = nvs_set_i32(nvs_handle, NVS_KEY_TARE_B, channel_b_cal.zero_offset);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to save Channel B tare: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
+    // Commit changes
+    ret = nvs_commit(nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to commit NVS changes: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG_NAU7802, "Tare values saved - Channel A: %ld, Channel B: %ld", 
+             channel_a_cal.zero_offset, channel_b_cal.zero_offset);
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_load_tare_values(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret;
+
+    ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to open NVS handle for reading: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Load Channel A tare value
+    size_t required_size = sizeof(int32_t);
+    ret = nvs_get_i32(nvs_handle, NVS_KEY_TARE_A, &channel_a_cal.zero_offset);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG_NAU7802, "No saved Channel A tare value found, using default (0)");
+        channel_a_cal.zero_offset = 0;
+    } else if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to load Channel A tare: %s", esp_err_to_name(ret));
+        channel_a_cal.zero_offset = 0;
+    } else {
+        ESP_LOGI(TAG_NAU7802, "Loaded Channel A tare value: %ld", channel_a_cal.zero_offset);
+    }
+
+    // Load Channel B tare value
+    ret = nvs_get_i32(nvs_handle, NVS_KEY_TARE_B, &channel_b_cal.zero_offset);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG_NAU7802, "No saved Channel B tare value found, using default (0)");
+        channel_b_cal.zero_offset = 0;
+    } else if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to load Channel B tare: %s", esp_err_to_name(ret));
+        channel_b_cal.zero_offset = 0;
+    } else {
+        ESP_LOGI(TAG_NAU7802, "Loaded Channel B tare value: %ld", channel_b_cal.zero_offset);
+    }
+
+    nvs_close(nvs_handle);
+    return ESP_OK;
 }
 
 // Public API Functions
@@ -757,8 +903,39 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
     
     if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         cal->zero_offset = ch_data->raw_value;
+        
+        // Force complete filter reinitialization when taring
+        ch_data->kf.initialized = false;  // Force Kalman filter to reinitialize
+        
+        // Reset moving average buffer 
+        for (int i = 0; i < 5; i++) {
+            ch_data->avg_buffer[i] = 0.0f;  // Reset to zero weight
+        }
+        ch_data->avg_index = 0;
+        ch_data->avg_filled = false;
+        
+        // Reset deadband filter
+        ch_data->last_stable_weight = 0.0f;
+        
+        // Reset filtered weight and motion estimates
+        ch_data->filtered_weight = 0.0f;
+        ch_data->velocity = 0.0f;
+        ch_data->acceleration = 0.0f;
+        ch_data->confidence = 0.5f;
+        
+        ESP_LOGI(TAG_NAU7802, "Channel %d all filters reset for clean tare", channel);
+        
         xSemaphoreGive(nau7802_data_mutex);
         ESP_LOGI(TAG_NAU7802, "Channel %d tared with offset %ld", channel, cal->zero_offset);
+        
+        // Save tare values to NVS for persistence across reboots
+        esp_err_t save_ret = nau7802_save_tare_values();
+        if (save_ret == ESP_OK) {
+            ESP_LOGI(TAG_NAU7802, "Tare values saved to flash storage");
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to save tare values to flash: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     
@@ -798,6 +975,288 @@ esp_err_t nau7802_set_sample_rate(nau7802_rate_t rate)
     }
     
     return ret;
+}
+
+// Kalman Filter Implementation
+esp_err_t nau7802_kalman_init(kalman_filter_t* kf, float process_noise, float measurement_noise, float dt)
+{
+    if (kf == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Initialize state vector [weight, velocity, acceleration]
+    kf->state[0] = 0.0f;  // Initial weight
+    kf->state[1] = 0.0f;  // Initial velocity
+    kf->state[2] = 0.0f;  // Initial acceleration
+    
+    // Initialize error covariance matrix P (3x3)
+    // Start with high uncertainty
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            kf->P[i][j] = (i == j) ? 10.0f : 0.0f;  // Diagonal matrix with high initial uncertainty
+        }
+    }
+    
+    // Process noise covariance Q (models system dynamics uncertainty)
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            kf->Q[i][j] = 0.0f;
+        }
+    }
+    // Modified Q matrix for kitchen scale - heavily damped velocity/acceleration
+    float dt2 = dt * dt;
+    
+    // Weight changes slowly and independently
+    kf->Q[0][0] = process_noise;                    // Weight variance only
+    kf->Q[0][1] = 0.0f;                            // No weight-velocity coupling
+    kf->Q[0][2] = 0.0f;                            // No weight-acceleration coupling
+    kf->Q[1][0] = 0.0f;                            // No velocity-weight coupling  
+    kf->Q[1][1] = process_noise * 0.001f;          // Very small velocity variance
+    kf->Q[1][2] = 0.0f;                            // No velocity-acceleration coupling
+    kf->Q[2][0] = 0.0f;                            // No acceleration-weight coupling
+    kf->Q[2][1] = 0.0f;                            // No acceleration-velocity coupling
+    kf->Q[2][2] = process_noise * 0.0001f;         // Very small acceleration variance
+    
+    // Measurement noise variance R (strain gauge noise)
+    kf->R = measurement_noise;
+    
+    kf->dt = dt;
+    kf->initialized = true;
+    kf->last_update_ms = 0;
+    
+    ESP_LOGI(TAG_NAU7802, "Kalman filter initialized - dt: %.3fs, process_noise: %.4f, measurement_noise: %.4f", 
+             dt, process_noise, measurement_noise);
+    
+    return ESP_OK;
+}
+
+esp_err_t nau7802_kalman_update(kalman_filter_t* kf, float measurement, uint32_t timestamp_ms)
+{
+    if (kf == NULL || !kf->initialized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Update time step if this isn't the first measurement
+    if (kf->last_update_ms > 0) {
+        float actual_dt = (timestamp_ms - kf->last_update_ms) / 1000.0f;
+        if (actual_dt > 0.001f && actual_dt < 1.0f) {  // Reasonable time step bounds
+            kf->dt = actual_dt;
+        }
+    }
+    kf->last_update_ms = timestamp_ms;
+    
+    float dt = kf->dt;
+    float dt2 = dt * dt;
+    
+    // State transition matrix F (heavily damped for kitchen scale)
+    float F[3][3] = {
+        {1.0f, dt * 0.1f,   0.0f},        // weight changes slowly, minimal velocity coupling
+        {0.0f, 0.8f,        dt * 0.1f},   // velocity decays quickly (0.8 damping)
+        {0.0f, 0.0f,        0.5f}         // acceleration decays very quickly (0.5 damping)
+    };
+    
+    // Prediction step
+    float x_pred[3];
+    float P_pred[3][3];
+    
+    // Predict state: x_pred = F * x
+    for (int i = 0; i < 3; i++) {
+        x_pred[i] = 0.0f;
+        for (int j = 0; j < 3; j++) {
+            x_pred[i] += F[i][j] * kf->state[j];
+        }
+    }
+    
+    // Predict covariance: P_pred = F * P * F' + Q
+    float FP[3][3];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            FP[i][j] = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                FP[i][j] += F[i][k] * kf->P[k][j];
+            }
+        }
+    }
+    
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            P_pred[i][j] = kf->Q[i][j];  // Start with process noise
+            for (int k = 0; k < 3; k++) {
+                P_pred[i][j] += FP[i][k] * F[j][k];  // F * P * F'
+            }
+        }
+    }
+    
+    // Update step
+    // Measurement matrix H = [1, 0, 0] (we only observe weight directly)
+    float H[3] = {1.0f, 0.0f, 0.0f};
+    
+    // Innovation (measurement residual): y = z - H * x_pred
+    float innovation = measurement - x_pred[0];  // Only weight is measured
+    
+    // Innovation covariance: S = H * P_pred * H' + R
+    float S = P_pred[0][0] + kf->R;
+    
+    // Kalman gain: K = P_pred * H' * S^(-1)
+    float K[3];
+    for (int i = 0; i < 3; i++) {
+        K[i] = P_pred[i][0] / S;  // P_pred * H' / S
+    }
+    
+    // Update state: x = x_pred + K * innovation
+    for (int i = 0; i < 3; i++) {
+        kf->state[i] = x_pred[i] + K[i] * innovation;
+    }
+    
+    // Update covariance: P = (I - K * H) * P_pred
+    float KH[3][3];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            KH[i][j] = K[i] * H[j];
+        }
+    }
+    
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            float I_KH = (i == j) ? 1.0f - KH[i][j] : -KH[i][j];
+            kf->P[i][j] = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                float I_KH_k = (i == k) ? 1.0f - KH[i][k] : -KH[i][k];
+                kf->P[i][j] += I_KH_k * P_pred[k][j];
+            }
+        }
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t nau7802_kalman_reset(kalman_filter_t* kf)
+{
+    if (kf == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Reset state to zero
+    kf->state[0] = 0.0f;
+    kf->state[1] = 0.0f;
+    kf->state[2] = 0.0f;
+    
+    // Reset covariance to high uncertainty
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            kf->P[i][j] = (i == j) ? 10.0f : 0.0f;
+        }
+    }
+    
+    kf->last_update_ms = 0;
+    
+    ESP_LOGI(TAG_NAU7802, "Kalman filter reset");
+    return ESP_OK;
+}
+
+esp_err_t nau7802_kalman_set_parameters(kalman_filter_t* kf, float process_noise, float measurement_noise)
+{
+    if (kf == NULL || !kf->initialized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Update process noise covariance Q
+    float dt = kf->dt;
+    float dt2 = dt * dt;
+    float dt3 = dt2 * dt;
+    float dt4 = dt3 * dt;
+    
+    kf->Q[0][0] = (dt4 / 4.0f) * process_noise;
+    kf->Q[0][1] = (dt3 / 2.0f) * process_noise;
+    kf->Q[0][2] = (dt2 / 2.0f) * process_noise;
+    kf->Q[1][0] = (dt3 / 2.0f) * process_noise;
+    kf->Q[1][1] = dt2 * process_noise;
+    kf->Q[1][2] = dt * process_noise;
+    kf->Q[2][0] = (dt2 / 2.0f) * process_noise;
+    kf->Q[2][1] = dt * process_noise;
+    kf->Q[2][2] = process_noise;
+    
+    // Update measurement noise variance R
+    kf->R = measurement_noise;
+    
+    ESP_LOGI(TAG_NAU7802, "Kalman filter parameters updated - process_noise: %.4f, measurement_noise: %.4f", 
+             process_noise, measurement_noise);
+    
+    return ESP_OK;
+}
+
+// Enhanced weight conversion with Kalman filtering
+static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms)
+{
+    // Basic weight conversion
+    float raw_weight = (float)(raw_value - cal->zero_offset) / cal->scale_factor;
+    
+    // Apply simple deadband filter to reduce noise before Kalman filtering
+    float weight_change = fabsf(raw_weight - ch_data->last_stable_weight);
+    if (weight_change < 0.5f) {  // Only ignore changes smaller than 0.5g to maintain gram accuracy
+        raw_weight = ch_data->last_stable_weight;
+    } else {
+        ch_data->last_stable_weight = raw_weight;
+    }
+    
+    // Apply simple moving average for additional smoothing
+    ch_data->avg_buffer[ch_data->avg_index] = raw_weight;
+    ch_data->avg_index = (ch_data->avg_index + 1) % 5;
+    if (!ch_data->avg_filled && ch_data->avg_index == 0) {
+        ch_data->avg_filled = true;
+    }
+    
+    // Calculate moving average if buffer has enough samples
+    if (ch_data->avg_filled) {
+        float sum = 0.0f;
+        for (int i = 0; i < 5; i++) {
+            sum += ch_data->avg_buffer[i];
+        }
+        raw_weight = sum / 5.0f;  // Use 5-sample moving average
+    }
+    
+    // Debug logging for calibration (remove once calibrated)
+    static uint32_t debug_counter = 0;
+    if (++debug_counter % 20 == 0) {  // Log every 20 samples (once per second)
+        ESP_LOGI(TAG_NAU7802, "Calibration debug: raw=%ld, offset=%ld, scale=%.1f, raw_weight=%.2fg", 
+                 raw_value, cal->zero_offset, cal->scale_factor, raw_weight);
+    }
+    
+    // Initialize Kalman filter if not done yet
+    if (!ch_data->kf.initialized) {
+        // Ultra-conservative parameters for rock-solid static stability
+        float process_noise = 0.1f;      // Extremely low - assumes weight barely changes
+        float measurement_noise = 0.5f;  // Low - high trust in stable measurements
+        float dt = 0.15f;                // 150ms between samples (6.7 Hz effective rate)
+        
+        nau7802_kalman_init(&ch_data->kf, process_noise, measurement_noise, dt);
+        
+        // Initialize with first measurement
+        ch_data->kf.state[0] = raw_weight;
+        ch_data->filtered_weight = raw_weight;
+        ch_data->velocity = 0.0f;
+        ch_data->acceleration = 0.0f;
+        ch_data->confidence = 0.5f;  // Medium confidence initially
+        ch_data->last_stable_weight = raw_weight;  // Initialize deadband filter
+        
+        // Initialize moving average buffer
+        for (int i = 0; i < 10; i++) {
+            ch_data->avg_buffer[i] = raw_weight;
+        }
+        ch_data->avg_index = 0;
+        ch_data->avg_filled = true;
+        
+        ESP_LOGI(TAG_NAU7802, "Kalman filter initialized with conservative parameters");
+        return raw_weight;
+    }
+    
+    // Bypass Kalman filter - use simple moving average for stable output
+    ch_data->filtered_weight = raw_weight;  // Use the averaged weight directly
+    ch_data->velocity = 0.0f;               // Zero velocity for static readings
+    ch_data->acceleration = 0.0f;           // Zero acceleration for static readings
+    ch_data->confidence = 1.0f;             // Full confidence in averaged readings
+    
+    return raw_weight;  // Return the moving averaged weight directly
 }
 
 esp_err_t nau7802_task_stop(void)

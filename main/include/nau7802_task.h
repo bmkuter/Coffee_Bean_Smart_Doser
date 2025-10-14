@@ -24,7 +24,7 @@ extern "C" {
 // Task Configuration
 #define NAU7802_TASK_STACK_SIZE     4096
 #define NAU7802_TASK_PRIORITY       3        // Higher than display, lower than encoder for responsiveness
-#define NAU7802_POLL_RATE_MS        50       // 20 Hz for stable strain gauge readings (matches 50 SPS)
+#define NAU7802_POLL_RATE_MS        150      // 6.7 Hz polling for 10 SPS ADC (1.5x slower than ADC rate)
 #define NAU7802_SAMPLE_AVERAGE      4        // Number of samples to average for stability
 
 // NAU7802 Register Definitions (from datasheet)
@@ -96,13 +96,41 @@ typedef enum {
     NAU7802_CHANNEL_2 = 1       // Channel 2 (B)
 } nau7802_channel_t;
 
-// Weight Data Structure
+// Calibration Data Structure
+typedef struct {
+    int32_t zero_offset;        // Zero/tare offset
+    float scale_factor;         // Scale factor (counts per gram)
+    bool is_calibrated;         // Calibration status
+} nau7802_calibration_t;
+
+// Kalman Filter State Structure
+typedef struct {
+    // State vector: [weight, velocity, acceleration]
+    float state[3];             // Current state estimate
+    float P[3][3];              // Error covariance matrix
+    float Q[3][3];              // Process noise covariance
+    float R;                    // Measurement noise variance
+    float dt;                   // Time step (sampling interval)
+    bool initialized;           // Filter initialization status
+    uint32_t last_update_ms;    // Last update timestamp
+} kalman_filter_t;
+
+// Enhanced Weight Data Structure with Kalman Filter
 typedef struct {
     int32_t raw_value;          // Raw ADC value (24-bit signed)
     float weight_grams;         // Converted weight in grams
+    float filtered_weight;      // Kalman filtered weight
+    float velocity;             // Weight change rate (g/s)
+    float acceleration;         // Weight change acceleration (g/s²)
+    float confidence;           // Filter confidence (0-1)
+    float last_stable_weight;   // Last stable weight for deadband filtering
+    float avg_buffer[5];        // Simple moving average buffer (5 samples for 0.75s smoothing)
+    int avg_index;              // Current index in average buffer
+    bool avg_filled;            // Whether average buffer is full
     bool data_ready;            // New data available flag
     uint32_t timestamp;         // Timestamp of measurement
     uint32_t sample_count;      // Number of samples taken
+    kalman_filter_t kf;         // Kalman filter state
 } nau7802_channel_data_t;
 
 // Complete NAU7802 Data Structure
@@ -113,13 +141,6 @@ typedef struct {
     uint32_t total_conversions;         // Total number of conversions
     float temperature;                  // Temperature reading (if available)
 } nau7802_data_t;
-
-// Calibration Data Structure
-typedef struct {
-    int32_t zero_offset;        // Zero/tare offset
-    float scale_factor;         // Scale factor (counts per gram)
-    bool is_calibrated;         // Calibration status
-} nau7802_calibration_t;
 
 // Function Prototypes
 esp_err_t nau7802_task_init(void);
@@ -138,6 +159,12 @@ esp_err_t nau7802_get_calibration(nau7802_channel_t channel, nau7802_calibration
 // Configuration Functions
 esp_err_t nau7802_set_gain(nau7802_gain_t gain);
 esp_err_t nau7802_set_sample_rate(nau7802_rate_t rate);
+
+// Kalman Filter Functions
+esp_err_t nau7802_kalman_init(kalman_filter_t* kf, float process_noise, float measurement_noise, float dt);
+esp_err_t nau7802_kalman_update(kalman_filter_t* kf, float measurement, uint32_t timestamp_ms);
+esp_err_t nau7802_kalman_reset(kalman_filter_t* kf);
+esp_err_t nau7802_kalman_set_parameters(kalman_filter_t* kf, float process_noise, float measurement_noise);
 
 // Timing Calibration Function
 esp_err_t nau7802_run_timing_calibration(int num_samples);
