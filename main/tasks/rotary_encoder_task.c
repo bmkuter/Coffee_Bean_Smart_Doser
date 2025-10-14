@@ -316,32 +316,19 @@ static void rotary_encoder_task(void* pvParameters)
             // Check for long press while button is held down
             if (raw_button_pressed && last_button_state && !long_press_triggered && button_press_start > 0) {
                 if ((current_time - button_press_start) >= long_press_duration) {
-                    // Long press detected - trigger reset
+                    // Long press detected - trigger callback
                     long_press_triggered = true;
                     showing_long_press_feedback = true;
                     
-                    ESP_LOGI(TAG_ROTARY, "Long press detected - Resetting encoder position to 0");
+                    ESP_LOGI(TAG_ROTARY, "Long press detected - triggering callback");
                     
-                    // Reset the hardware encoder position to 0
-                    esp_err_t reset_ret = rotary_encoder_set_position(0);
-                    if (reset_ret == ESP_OK) {
-                        // Update our local data immediately
-                        if (xSemaphoreTake(rotary_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            rotary_data.position = 0;  // Reset to 0 (already negated)
-                            rotary_data.delta = 0;     // Clear any pending delta
-                            xSemaphoreGive(rotary_data_mutex);
-                        }
-                        
-                        // Update display immediately with reset position
-                        latest_position = 0;
-                        cumulative_delta = 0;
-                        // Use special delta value (-999) to indicate this is a reset operation
-                        display_send_encoder_data(0, -999, true);  // Show button pressed with reset position
-                        
-                        ESP_LOGI(TAG_ROTARY, "Encoder position reset to 0 successfully");
-                    } else {
-                        ESP_LOGE(TAG_ROTARY, "Failed to reset encoder position: %s", esp_err_to_name(reset_ret));
+                    // Call callback if registered
+                    if (event_callback != NULL) {
+                        event_callback(ROTARY_EVENT_LONG_PRESS, rotary_data.position, 0);
                     }
+                    
+                    // Update display with long press feedback
+                    display_send_encoder_data(rotary_data.position, 0, true);  // Show button pressed
                 }
             }
         }

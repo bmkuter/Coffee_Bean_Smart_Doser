@@ -19,6 +19,7 @@
 #include "ssd1306.h"  // Official ESP-IDF SSD1306 component
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 // Display configuration
 #define SSD1306_WIDTH               128
@@ -32,6 +33,22 @@ static bool display_task_running = false;
 static uint32_t messages_processed = 0;
 static uint32_t queue_overflows = 0;
 
+// Status message overlay variables
+static bool status_message_active = false;
+static TickType_t status_message_start_time = 0;
+static const TickType_t STATUS_MESSAGE_TIMEOUT = pdMS_TO_TICKS(3000);  // 3 seconds
+
+// Latest data for display (all display state in one place)
+static int32_t latest_encoder_position = 0;
+static int32_t latest_encoder_delta = 0;
+static bool latest_button_pressed = false;
+static bool encoder_data_available = false;
+
+// Latest weight data for display on encoder screen
+static float latest_container_weight = 0.0f;
+static float latest_dosage_weight = 0.0f;
+static bool weight_data_available = false;
+
 // SSD1306 device handle for the official component
 static SSD1306_t ssd1306_dev;
 static i2c_master_dev_handle_t display_i2c_dev_handle = NULL;
@@ -42,6 +59,10 @@ static esp_err_t ssd1306_display_init(void);
 static void display_process_encoder_message(const display_message_t* msg);
 static void display_process_status_message(const display_message_t* msg);
 static void display_process_coffee_message(const display_message_t* msg);
+static void display_draw_status_overlay(const char* message);
+static void display_clear_status_overlay(void);
+static void display_redraw_header_lines(void);
+static void display_refresh_main_screen(void);
 
 esp_err_t display_task_init(void)
 {
@@ -70,10 +91,12 @@ esp_err_t display_task_init(void)
     // Clear display and show initial encoder display layout
     ssd1306_clear_screen(&ssd1306_dev, false);
     ssd1306_display_text(&ssd1306_dev, 0, "Rotary Encoder", 14, false);
-    ssd1306_display_text(&ssd1306_dev, 1, "Hold btn=reset", 14, false);
+    ssd1306_display_text(&ssd1306_dev, 1, "Long press=tare", 15, false);
     ssd1306_display_text(&ssd1306_dev, 2, "Pos: 0       ", 13, false);
     ssd1306_display_text(&ssd1306_dev, 4, "Delta: 0     ", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 6, "Btn: ---     ", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 5, "Btn: ---     ", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 6, "Cont: -----g ", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 7, "Dose: -----g ", 13, false);
 
     ESP_LOGI(TAG_DISPLAY, "Display task initialized successfully");
     return ESP_OK;
@@ -137,6 +160,9 @@ static void display_task_function(void* pvParameters)
                     
                 case DISPLAY_MSG_CLEAR_SCREEN:
                     ssd1306_clear_screen(&ssd1306_dev, false);
+                    // After clearing, redraw everything
+                    display_redraw_header_lines();
+                    display_refresh_main_screen();
                     break;
                     
                 case DISPLAY_MSG_SHUTDOWN:
@@ -146,6 +172,15 @@ static void display_task_function(void* pvParameters)
                 default:
                     ESP_LOGW(TAG_DISPLAY, "Unknown message type: %d", message.type);
                     break;
+            }
+        }
+        
+        // Check for status message timeout
+        if (status_message_active) {
+            TickType_t current_time = xTaskGetTickCount();
+            if ((current_time - status_message_start_time) >= STATUS_MESSAGE_TIMEOUT) {
+                display_clear_status_overlay();
+                status_message_active = false;
             }
         }
         
@@ -163,63 +198,38 @@ static void display_task_function(void* pvParameters)
 
 static void display_process_encoder_message(const display_message_t* msg)
 {
-    char position_text[32];
-    char delta_text[32];
-    char button_text[16];
+    // Update encoder data
+    latest_encoder_position = msg->data.encoder_data.position;
+    latest_encoder_delta = msg->data.encoder_data.delta;
+    latest_button_pressed = msg->data.encoder_data.button_pressed;
+    encoder_data_available = true;
     
-    // Don't clear the entire screen - just update the changing values
-    // Title remains static, so no need to redraw it every time
-    
-    // Show position (clear line first by overwriting with spaces, then write new value)
-    snprintf(position_text, sizeof(position_text), "Pos: %-8ld", msg->data.encoder_data.position);
-    ssd1306_display_text(&ssd1306_dev, 2, position_text, strlen(position_text), false);
-    
-    // Show delta (always show, even if zero, to clear previous values)
-    // Handle special case where delta = -999 indicates a reset operation
-    if (msg->data.encoder_data.delta == -999) {
-        // Don't display the special delta value, show 0 instead for reset
-        snprintf(delta_text, sizeof(delta_text), "Delta: 0     ");
-    } else {
-        snprintf(delta_text, sizeof(delta_text), "Delta: %s%-6ld", 
-                 msg->data.encoder_data.delta > 0 ? "+" : "", msg->data.encoder_data.delta);
-    }
-    ssd1306_display_text(&ssd1306_dev, 4, delta_text, strlen(delta_text), false);
-    
-    // Show button state with special indication for reset
-    // Look for special delta value (-999) which indicates an actual reset operation
-    if (msg->data.encoder_data.button_pressed && msg->data.encoder_data.delta == -999) {
-        snprintf(button_text, sizeof(button_text), "Btn: RESET!");
-    } else {
-        snprintf(button_text, sizeof(button_text), "Btn: %-6s", 
-                 msg->data.encoder_data.button_pressed ? "PRESS" : "---");
-    }
-    ssd1306_display_text(&ssd1306_dev, 6, button_text, strlen(button_text), false);
+    // Refresh the entire main screen
+    display_refresh_main_screen();
 }
 
 static void display_process_status_message(const display_message_t* msg)
 {
-    // Add status message to display (could be overlayed or on separate area)
-    ssd1306_display_text(&ssd1306_dev, 7, msg->data.system_status.status_text, 
-                        strlen(msg->data.system_status.status_text), false);
+    // Show status message in overlay above header lines
+    display_draw_status_overlay(msg->data.system_status.status_text);
+    status_message_active = true;
+    status_message_start_time = xTaskGetTickCount();
 }
 
 static void display_process_coffee_message(const display_message_t* msg)
 {
-    char target_text[32];
-    char current_text[32];
+    // Store the latest weight data for display on encoder screen
+    latest_container_weight = msg->data.coffee_info.current_weight;
+    latest_dosage_weight = msg->data.coffee_info.target_weight;
+    weight_data_available = true;
     
-    ssd1306_clear_screen(&ssd1306_dev, false);
-    ssd1306_display_text(&ssd1306_dev, 0, "Coffee Dosing", 13, false);
-    
-    snprintf(target_text, sizeof(target_text), "Target: %.1fg", msg->data.coffee_info.target_weight);
-    ssd1306_display_text(&ssd1306_dev, 2, target_text, strlen(target_text), false);
-    
-    snprintf(current_text, sizeof(current_text), "Current: %.1fg", msg->data.coffee_info.current_weight);
-    ssd1306_display_text(&ssd1306_dev, 4, current_text, strlen(current_text), false);
-    
-    if (msg->data.coffee_info.dosing_active) {
-        ssd1306_display_text(&ssd1306_dev, 6, "DOSING...", 9, false);
-    }
+    ESP_LOGD(TAG_DISPLAY, "Coffee Info - Target: %.1fg, Current: %.1fg, Dosing: %s",
+             msg->data.coffee_info.target_weight,
+             msg->data.coffee_info.current_weight,
+             msg->data.coffee_info.dosing_active ? "YES" : "NO");
+
+    // Refresh the entire main screen to show updated weights
+    display_refresh_main_screen();
 }
 
 // SSD1306 Hardware Functions using the shared I2C bus
@@ -260,6 +270,120 @@ static esp_err_t ssd1306_display_init(void)
     
     ESP_LOGI(TAG_DISPLAY, "SSD1306 initialized successfully using shared I2C bus");
     return ESP_OK;
+}
+
+static void display_refresh_main_screen(void)
+{
+    // Only refresh if we have encoder data (prevents premature updates)
+    if (!encoder_data_available) {
+        return;
+    }
+    
+    char position_text[32];
+    char delta_text[32];
+    char button_text[16];
+    char container_text[20];
+    char dosage_text[20];
+    
+    // Update encoder position
+    snprintf(position_text, sizeof(position_text), "Pos: %-8ld", latest_encoder_position);
+    ssd1306_display_text(&ssd1306_dev, 2, position_text, strlen(position_text), false);
+    
+    // Update encoder delta
+    if (latest_encoder_delta == -999) {
+        // Special case for reset operation
+        snprintf(delta_text, sizeof(delta_text), "Delta: 0     ");
+    } else {
+        snprintf(delta_text, sizeof(delta_text), "Delta: %s%-6ld", 
+                 latest_encoder_delta > 0 ? "+" : "", latest_encoder_delta);
+    }
+    ssd1306_display_text(&ssd1306_dev, 4, delta_text, strlen(delta_text), false);
+    
+    // Update button state
+    if (latest_button_pressed && latest_encoder_delta == -999) {
+        snprintf(button_text, sizeof(button_text), "Btn: RESET!");
+    } else {
+        snprintf(button_text, sizeof(button_text), "Btn: %-6s", 
+                 latest_button_pressed ? "PRESS" : "---");
+    }
+    ssd1306_display_text(&ssd1306_dev, 5, button_text, strlen(button_text), false);
+    
+    // Update weight measurements
+    if (weight_data_available) {
+        // Container weight (Channel A)
+        if (latest_container_weight == -999.0f) {
+            snprintf(container_text, sizeof(container_text), "Cont: NO CONN");
+        } else {
+            snprintf(container_text, sizeof(container_text), "Cont: %6dg", (int)round(latest_container_weight));
+        }
+        
+        // Dosage weight (Channel B)
+        if (latest_dosage_weight == -999.0f) {
+            snprintf(dosage_text, sizeof(dosage_text), "Dose: ------");
+        } else {
+            snprintf(dosage_text, sizeof(dosage_text), "Dose: %6dg", (int)round(latest_dosage_weight));
+        }
+    } else {
+        // No weight data available yet
+        snprintf(container_text, sizeof(container_text), "Cont: -----g");
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: -----g");
+    }
+    
+    ssd1306_display_text(&ssd1306_dev, 6, container_text, strlen(container_text), false);
+    ssd1306_display_text(&ssd1306_dev, 7, dosage_text, strlen(dosage_text), false);
+    
+    ESP_LOGD(TAG_DISPLAY, "Screen refreshed - Pos: %ld, Delta: %ld, Btn: %s, Cont: %.1fg, Dose: %.1fg",
+             latest_encoder_position, latest_encoder_delta, 
+             latest_button_pressed ? "PRESS" : "---",
+             latest_container_weight, latest_dosage_weight);
+}
+
+// Status message overlay functions
+static void display_draw_status_overlay(const char* message)
+{
+    // Calculate message dimensions and centering
+    int msg_len = strlen(message);
+    int start_x = (SSD1306_WIDTH - (msg_len * 6)) / 2;  // Center horizontally (6px per char)
+    int start_y = 0;  // Start at top
+    int box_width = msg_len * 6 + 8;  // Message width + padding
+    int box_height = 16;  // Two lines of 8px text
+    int box_x = (SSD1306_WIDTH - box_width) / 2;
+    
+    // Clear the area first using clear_line for top two rows
+    ssd1306_clear_line(&ssd1306_dev, 0, false);
+    ssd1306_clear_line(&ssd1306_dev, 1, false);
+    
+    // Draw border using lines
+    // Top and bottom borders
+    _ssd1306_line(&ssd1306_dev, box_x, start_y, box_x + box_width - 1, start_y, true);
+    _ssd1306_line(&ssd1306_dev, box_x, start_y + box_height - 1, box_x + box_width - 1, start_y + box_height - 1, true);
+    // Left and right borders
+    _ssd1306_line(&ssd1306_dev, box_x, start_y, box_x, start_y + box_height - 1, true);
+    _ssd1306_line(&ssd1306_dev, box_x + box_width - 1, start_y, box_x + box_width - 1, start_y + box_height - 1, true);
+    
+    // Draw white text in the center of the box
+    // Use regular text size and center it within the box
+    ssd1306_display_text(&ssd1306_dev, 0, message, msg_len, true);  // Inverted text (white on black)
+}
+
+static void display_clear_status_overlay(void)
+{
+    // Redraw the header lines to clear the overlay
+    display_redraw_header_lines();
+    
+    // Refresh the main screen content after clearing overlay
+    display_refresh_main_screen();
+}
+
+static void display_redraw_header_lines(void)
+{
+    // Clear the top two lines
+    ssd1306_clear_line(&ssd1306_dev, 0, false);
+    ssd1306_clear_line(&ssd1306_dev, 1, false);
+    
+    // Redraw header text
+    ssd1306_display_text(&ssd1306_dev, 0, "Rotary Encoder", 14, false);
+    ssd1306_display_text(&ssd1306_dev, 1, "Long press=tare", 15, false);
 }
 
 // Public API Functions

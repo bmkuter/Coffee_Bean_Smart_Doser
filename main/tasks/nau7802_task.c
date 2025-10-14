@@ -1,0 +1,1012 @@
+/*
+ * NAU7802 ADC Task - 24-bit Strain Gauge ADC Implementation
+ * 
+ * Manages dual-channel 24-bit ADC for precision weight measurements.
+ * Provides calibrated weight data to the display task via message queues.
+ */
+
+#include "nau7802_task.h"
+#include "display_task.h"
+#include "shared_i2c_bus.h"
+#include "coffee_doser_config.h"
+#include "rotary_encoder_task.h"
+#include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include <string.h>
+#include <math.h>
+
+// Task variables
+static TaskHandle_t nau7802_task_handle = NULL;
+static bool nau7802_task_running = false;
+static SemaphoreHandle_t nau7802_data_mutex = NULL;
+static nau7802_data_t nau7802_data = {0};
+
+// Connection status tracking
+static bool channel_a_connected = false;
+static bool channel_b_connected = false;
+static uint32_t channel_a_consecutive_errors = 0;
+static uint32_t channel_b_consecutive_errors = 0;
+#define MAX_CONSECUTIVE_ERRORS 5  // Consider disconnected after 5 consecutive errors
+
+// I2C device handle
+static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
+
+// Calibration data for both channels
+static nau7802_calibration_t channel_a_cal = {0, 1.0f, false};
+static nau7802_calibration_t channel_b_cal = {0, 1.0f, false};
+
+// Configuration
+static nau7802_gain_t current_gain = NAU7802_GAIN_64X;  // Maximum sensitivity for strain gauges  
+static nau7802_rate_t current_rate = NAU7802_RATE_40SPS;
+
+// Dynamic timeout optimization
+static uint32_t optimal_timeout_ms = 100;  // Default timeout, will be calibrated
+static bool timeout_calibrated = false;
+
+// Internal function prototypes
+static void nau7802_task_function(void* pvParameters);
+static esp_err_t nau7802_i2c_init(void);
+static esp_err_t nau7802_device_init(void);
+static esp_err_t nau7802_write_register(uint8_t reg_addr, uint8_t value);
+static esp_err_t nau7802_read_register(uint8_t reg_addr, uint8_t* value);
+static esp_err_t nau7802_read_adc_raw(int32_t* raw_value);
+static esp_err_t nau7802_select_channel(nau7802_channel_t channel);
+static esp_err_t nau7802_wait_for_data_ready(uint32_t timeout_ms);
+static bool nau7802_is_data_ready(void);
+static float nau7802_raw_to_weight(int32_t raw_value, nau7802_calibration_t* cal);
+static esp_err_t nau7802_perform_calibration(void);
+static void nau7802_calibrate_timing(int num_samples);
+static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position, int32_t delta);
+
+esp_err_t nau7802_task_init(void)
+{
+    if (nau7802_task_running) {
+        ESP_LOGW(TAG_NAU7802, "NAU7802 task already initialized");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG_NAU7802, "Initializing NAU7802 24-bit ADC task");
+
+    // Initialize I2C for NAU7802
+    esp_err_t ret = nau7802_i2c_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to initialize I2C: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Create data mutex
+    nau7802_data_mutex = xSemaphoreCreateMutex();
+    if (nau7802_data_mutex == NULL) {
+        ESP_LOGE(TAG_NAU7802, "Failed to create NAU7802 data mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Initialize device hardware
+    ret = nau7802_device_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to initialize NAU7802 device: %s", esp_err_to_name(ret));
+        vSemaphoreDelete(nau7802_data_mutex);
+        return ret;
+    }
+
+    // Initialize data structure
+    memset(&nau7802_data, 0, sizeof(nau7802_data_t));
+    nau7802_data.device_ready = true;
+
+    // Register callback with rotary encoder for tare functionality
+    ret = rotary_encoder_register_callback(nau7802_rotary_event_handler);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to register rotary encoder callback: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG_NAU7802, "Tare-on-click functionality will not be available");
+    } else {
+        ESP_LOGI(TAG_NAU7802, "Rotary encoder callback registered - click to tare scale");
+    }
+
+    ESP_LOGI(TAG_NAU7802, "NAU7802 task initialized successfully");
+    return ESP_OK;
+}
+
+esp_err_t nau7802_task_start(void)
+{
+    if (nau7802_task_running) {
+        ESP_LOGW(TAG_NAU7802, "NAU7802 task already running");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG_NAU7802, "Starting NAU7802 task");
+
+    // Set flag before creating task to prevent race condition
+    nau7802_task_running = true;
+    
+    // Create the task
+    BaseType_t ret = xTaskCreate(
+        nau7802_task_function,
+        "nau7802_task",
+        NAU7802_TASK_STACK_SIZE,
+        NULL,
+        NAU7802_TASK_PRIORITY,
+        &nau7802_task_handle
+    );
+
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG_NAU7802, "Failed to create NAU7802 task");
+        nau7802_task_running = false;  // Reset flag on failure
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG_NAU7802, "NAU7802 task started successfully");
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_i2c_init(void)
+{
+    ESP_LOGI(TAG_NAU7802, "Adding NAU7802 to shared I2C bus");
+
+    // Add NAU7802 device to the shared bus
+    esp_err_t ret = shared_i2c_add_device(NAU7802_ADDR, 100000, &nau7802_i2c_dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to add NAU7802 to shared I2C bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG_NAU7802, "NAU7802 added to shared I2C bus successfully");
+    return ESP_OK;
+}
+
+static void nau7802_task_function(void* pvParameters)
+{
+    ESP_LOGI(TAG_NAU7802, "NAU7802 task running - monitoring dual-channel ADC");
+
+    uint32_t channel_a_samples = 0;
+    uint32_t channel_b_samples = 0;
+    uint32_t error_count = 0;
+    uint32_t last_error_log = 0;
+
+    // Calibrate optimal timeout on startup
+    // uint32_t calibrated_timeout = 100;  // Default fallback
+    // esp_err_t cal_ret = nau7802_test_timeout_values(20, 200, 10, &calibrated_timeout);
+    // if (cal_ret == ESP_OK) {
+    //     optimal_timeout_ms = calibrated_timeout;
+    //     timeout_calibrated = true;
+    //     ESP_LOGI(TAG_NAU7802, "Using calibrated timeout: %lu ms", optimal_timeout_ms);
+    // } else {
+    //     ESP_LOGW(TAG_NAU7802, "Timeout calibration failed, using default: %lu ms", optimal_timeout_ms);
+    // }
+
+    while (nau7802_task_running) {
+        esp_err_t ret;
+        bool channel_a_success = false;
+        bool channel_b_success = false;
+        
+        // Read Channel A (Container Weight)
+        ret = nau7802_select_channel(NAU7802_CHANNEL_1);
+        if (ret == ESP_OK) {
+            ret = nau7802_wait_for_data_ready(250);  // Use calibrated timeout
+            if (ret == ESP_OK) {
+                int32_t raw_value;
+                ret = nau7802_read_adc_raw(&raw_value);
+                if (ret == ESP_OK) {
+                    // Update Channel A data
+                    if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        nau7802_data.channel_a.raw_value = raw_value;
+                        nau7802_data.channel_a.weight_grams = nau7802_raw_to_weight(raw_value, &channel_a_cal);
+                        nau7802_data.channel_a.data_ready = true;
+                        nau7802_data.channel_a.timestamp = esp_timer_get_time() / 1000;
+                        nau7802_data.channel_a.sample_count = ++channel_a_samples;
+                        nau7802_data.total_conversions++;
+                        xSemaphoreGive(nau7802_data_mutex);
+
+                        // Check if the weight value indicates a disconnected sensor
+                        if (nau7802_data.channel_a.weight_grams < -900.0f) {
+                            ESP_LOGW(TAG_NAU7802, "Channel A: invalid weight %.2fg indicates disconnection", 
+                                     nau7802_data.channel_a.weight_grams);
+                            channel_a_consecutive_errors++;
+                        } else {
+                            ESP_LOGD(TAG_NAU7802, "Channel A: raw=%ld, weight=%.2fg", raw_value, nau7802_data.channel_a.weight_grams);
+                            channel_a_success = true;
+                            
+                            // Reset error count and mark as connected
+                            channel_a_consecutive_errors = 0;
+                            if (!channel_a_connected) {
+                                channel_a_connected = true;
+                                ESP_LOGI(TAG_NAU7802, "Channel A strain gauge connected and responding");
+                            }
+                        }
+                    }
+                } else {
+                    ESP_LOGW(TAG_NAU7802, "Failed to read Channel A ADC data: %s", esp_err_to_name(ret));
+                    channel_a_consecutive_errors++;
+                }
+            } else {
+                ESP_LOGD(TAG_NAU7802, "Channel A data ready timeout: %s", esp_err_to_name(ret));
+                channel_a_consecutive_errors++;
+            }
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to select Channel A: %s", esp_err_to_name(ret));
+            channel_a_consecutive_errors++;
+        }
+        
+        // Check if Channel A should be considered disconnected
+        if (channel_a_consecutive_errors >= MAX_CONSECUTIVE_ERRORS && channel_a_connected) {
+            channel_a_connected = false;
+            ESP_LOGW(TAG_NAU7802, "Channel A strain gauge appears disconnected (errors: %lu)", channel_a_consecutive_errors);
+        }
+
+        // Send display update with current weight readings (rounded to integers)
+        int display_container_weight = channel_a_connected ? (int)round(nau7802_data.channel_a.weight_grams) : -999;
+        int display_dosage_weight = -999;  // Channel B disabled for now
+        
+        // Send display update to show current weights
+        display_send_coffee_info((float)display_dosage_weight, (float)display_container_weight, false);
+
+        // // Small delay between channel reads (important for strain gauge settling)
+        // vTaskDelay(pdMS_TO_TICKS(10));  // Increased for better strain gauge stability
+
+        // // Read Channel B (Dosage Cup Weight)
+        // ret = nau7802_select_channel(NAU7802_CHANNEL_2);
+        // if (ret == ESP_OK) {
+        //     ret = nau7802_wait_for_data_ready(optimal_timeout_ms);  // Use calibrated timeout  // Consistent timeout for 40 SPS
+        //     if (ret == ESP_OK) {
+        //         int32_t raw_value;
+        //         ret = nau7802_read_adc_raw(&raw_value);
+        //         if (ret == ESP_OK) {
+        //             // Update Channel B data
+        //             if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        //                 nau7802_data.channel_b.raw_value = raw_value;
+        //                 nau7802_data.channel_b.weight_grams = nau7802_raw_to_weight(raw_value, &channel_b_cal);
+        //                 nau7802_data.channel_b.data_ready = true;
+        //                 nau7802_data.channel_b.timestamp = esp_timer_get_time() / 1000;
+        //                 nau7802_data.channel_b.sample_count = ++channel_b_samples;
+        //                 nau7802_data.total_conversions++;
+        //                 xSemaphoreGive(nau7802_data_mutex);
+
+        //                 // Check if the weight value indicates a disconnected sensor
+        //                 if (nau7802_data.channel_b.weight_grams < -900.0f) {
+        //                     ESP_LOGW(TAG_NAU7802, "Channel B: invalid weight %.2fg indicates disconnection", 
+        //                              nau7802_data.channel_b.weight_grams);
+        //                     channel_b_consecutive_errors++;
+        //                 } else {
+        //                     ESP_LOGD(TAG_NAU7802, "Channel B: raw=%ld, weight=%.2fg", raw_value, nau7802_data.channel_b.weight_grams);
+        //                     channel_b_success = true;
+                            
+        //                     // Reset error count and mark as connected
+        //                     channel_b_consecutive_errors = 0;
+        //                     if (!channel_b_connected) {
+        //                         channel_b_connected = true;
+        //                         ESP_LOGI(TAG_NAU7802, "Channel B strain gauge connected and responding");
+        //                     }
+        //                 }
+        //             }
+        //         } else {
+        //             ESP_LOGW(TAG_NAU7802, "Failed to read Channel B ADC data: %s", esp_err_to_name(ret));
+        //             channel_b_consecutive_errors++;
+        //         }
+        //     } else {
+        //         ESP_LOGD(TAG_NAU7802, "Channel B data ready timeout: %s", esp_err_to_name(ret));
+        //         channel_b_consecutive_errors++;
+        //     }
+        // } else {
+        //     ESP_LOGW(TAG_NAU7802, "Failed to select Channel B: %s", esp_err_to_name(ret));
+        //     channel_b_consecutive_errors++;
+        // }
+        
+        // // Check if Channel B should be considered disconnected
+        // if (channel_b_consecutive_errors >= MAX_CONSECUTIVE_ERRORS && channel_b_connected) {
+        //     channel_b_connected = false;
+        //     ESP_LOGW(TAG_NAU7802, "Channel B strain gauge appears disconnected (errors: %lu)", channel_b_consecutive_errors);
+        // }
+
+        // // Send display update with current connection status
+        // float display_container_weight = channel_a_connected ? nau7802_data.channel_a.weight_grams : -999.0f;
+        // float display_dosage_weight = channel_b_connected ? nau7802_data.channel_b.weight_grams : -999.0f;
+        
+        // // Always send display update to ensure current status is shown
+        // display_send_coffee_info(display_dosage_weight, display_container_weight, false);
+
+        // Error counting and periodic logging for overall status
+        if (!channel_a_connected && !channel_b_connected) {
+            error_count++;
+            uint32_t current_time = esp_timer_get_time() / 1000000;  // Convert to seconds
+            if (current_time - last_error_log >= 5) {  // Log every 5 seconds
+                ESP_LOGW(TAG_NAU7802, "No strain gauges connected (total errors: %lu). Check connections.", error_count);
+                last_error_log = current_time;
+            }
+        } else {
+            // Reset error count when at least one channel is connected
+            if (error_count > 0 && (channel_a_connected || channel_b_connected)) {
+                ESP_LOGI(TAG_NAU7802, "At least one strain gauge connected after %lu errors", error_count);
+                error_count = 0;
+            }
+        }
+
+        // Task delay between complete dual-channel cycles
+        vTaskDelay(pdMS_TO_TICKS(NAU7802_POLL_RATE_MS));
+    }
+
+    ESP_LOGI(TAG_NAU7802, "NAU7802 task stopped");
+    vTaskDelete(NULL);
+}
+
+static esp_err_t nau7802_device_init(void)
+{
+    ESP_LOGI(TAG_NAU7802, "Initializing NAU7802 device");
+    
+    // First, probe the device to check basic I2C communication
+    esp_err_t probe_ret = i2c_master_probe(shared_i2c_get_bus_handle(), NAU7802_ADDR, 1000);
+    if (probe_ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "NAU7802 device not responding at address 0x%02X: %s", NAU7802_ADDR, esp_err_to_name(probe_ret));
+        ESP_LOGE(TAG_NAU7802, "Check NAU7802 wiring and power connections");
+        return probe_ret;
+    }
+    ESP_LOGI(TAG_NAU7802, "NAU7802 device detected at address 0x%02X", NAU7802_ADDR);
+    
+    // Reset the device (Adafruit reset procedure)
+    esp_err_t ret = nau7802_write_register(NAU7802_REG_PU_CTRL, NAU7802_PU_CTRL_RR);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to reset device");
+        return ret;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(10));  // Wait for reset
+    
+    // Clear reset bit and power up digital
+    ret = nau7802_write_register(NAU7802_REG_PU_CTRL, NAU7802_PU_CTRL_PUD);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to power up digital");
+        return ret;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    // Check if device is ready (power up ready bit)
+    uint8_t status;
+    ret = nau7802_read_register(NAU7802_REG_PU_CTRL, &status);
+    if (ret != ESP_OK || !(status & NAU7802_PU_CTRL_PUR)) {
+        ESP_LOGE(TAG_NAU7802, "Device not ready after digital power up");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // Power up analog
+    uint8_t pu_ctrl = NAU7802_PU_CTRL_PUD | NAU7802_PU_CTRL_PUA;
+    ret = nau7802_write_register(NAU7802_REG_PU_CTRL, pu_ctrl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to power up analog");
+        return ret;
+    }
+    
+    // Wait for analog power up (600ms as per Adafruit)
+    ESP_LOGI(TAG_NAU7802, "Waiting for analog power up stabilization...");
+    vTaskDelay(pdMS_TO_TICKS(600));
+    
+    // Set LDO to 3.0V and enable internal AVDD source (critical for operation)
+    pu_ctrl |= NAU7802_PU_CTRL_AVDDS;  // Enable internal AVDD source
+    ret = nau7802_write_register(NAU7802_REG_PU_CTRL, pu_ctrl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to enable internal AVDD");
+        return ret;
+    }
+    
+    // Configure LDO voltage (3.0V)
+    uint8_t ctrl1_val;
+    ret = nau7802_read_register(NAU7802_REG_CTRL1, &ctrl1_val);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read CTRL1 register");
+        return ret;
+    }
+    
+    ctrl1_val &= ~NAU7802_CTRL1_VLDO;  // Clear LDO bits
+    ctrl1_val |= (5 << 3);  // Set to 3.0V (NAU7802_3V0 = 5)
+    ret = nau7802_write_register(NAU7802_REG_CTRL1, ctrl1_val);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to set LDO voltage");
+        return ret;
+    }
+    
+    // Now check revision ID after device is fully powered and stable
+    uint8_t revision_id;
+    ret = nau7802_read_register(NAU7802_REG_REVISION_ID, &revision_id);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read revision ID: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "NAU7802 Revision ID: 0x%02X (after full power up)", revision_id);
+    
+    // Check if the low nibble is 0xF (as per Adafruit implementation)
+    if ((revision_id & 0x0F) != 0x0F) {
+        ESP_LOGW(TAG_NAU7802, "Unexpected revision ID low nibble: 0x%X (expected 0xF)", revision_id & 0x0F);
+        ESP_LOGW(TAG_NAU7802, "This may be a different NAU7802 variant or firmware version");
+    } else {
+        ESP_LOGI(TAG_NAU7802, "NAU7802 revision ID check passed");
+    }
+    
+    // Read a few more registers for diagnostics
+    uint8_t pu_ctrl_readback;
+    ret = nau7802_read_register(NAU7802_REG_PU_CTRL, &pu_ctrl_readback);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG_NAU7802, "PU_CTRL register: 0x%02X", pu_ctrl_readback);
+    }
+    
+    uint8_t ctrl1_readback;
+    ret = nau7802_read_register(NAU7802_REG_CTRL1, &ctrl1_readback);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG_NAU7802, "CTRL1 register: 0x%02X", ctrl1_readback);
+    }
+    
+    // Set gain to 128x
+    ret = nau7802_set_gain(current_gain);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to set gain");
+        return ret;
+    }
+    
+    // Set sample rate to 20 SPS
+    ret = nau7802_set_sample_rate(current_rate);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to set sample rate");
+        return ret;
+    }
+    
+    // Disable ADC chopper clock (as per Adafruit)
+    uint8_t adc_reg;
+    ret = nau7802_read_register(NAU7802_REG_ADC, &adc_reg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read ADC register");
+        return ret;
+    }
+    
+    adc_reg &= ~0x30;  // Clear chopper clock bits
+    adc_reg |= 0x30;   // Set to disable chopper (0x3 in bits 4-5)
+    ret = nau7802_write_register(NAU7802_REG_ADC, adc_reg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to configure ADC chopper");
+        return ret;
+    }
+    
+    // Configure for low ESR capacitors (as per Adafruit)
+    uint8_t pga_reg;
+    ret = nau7802_read_register(NAU7802_REG_PGA, &pga_reg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read PGA register");
+        return ret;
+    }
+    
+    pga_reg &= ~0x40;  // Clear bit 6 for low ESR mode
+    ret = nau7802_write_register(NAU7802_REG_PGA, pga_reg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to configure PGA for low ESR");
+        return ret;
+    }
+    
+    // Start conversions
+    ret = nau7802_read_register(NAU7802_REG_PU_CTRL, &pu_ctrl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read PU_CTRL for conversion start");
+        return ret;
+    }
+    
+    pu_ctrl |= NAU7802_PU_CTRL_CS;  // Start conversions
+    ret = nau7802_write_register(NAU7802_REG_PU_CTRL, pu_ctrl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to start conversions");
+        return ret;
+    }
+    
+    // Perform initial calibration
+    ret = nau7802_perform_calibration();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Initial calibration failed, continuing anyway");
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "NAU7802 device initialized successfully");
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_write_register(uint8_t reg_addr, uint8_t value)
+{
+    uint8_t write_data[2] = {reg_addr, value};
+    return i2c_master_transmit(nau7802_i2c_dev_handle, write_data, 2, 1000);
+}
+
+static esp_err_t nau7802_read_register(uint8_t reg_addr, uint8_t* value)
+{
+    esp_err_t ret = i2c_master_transmit(nau7802_i2c_dev_handle, &reg_addr, 1, 1000);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    return i2c_master_receive(nau7802_i2c_dev_handle, value, 1, 1000);
+}
+
+static esp_err_t nau7802_read_adc_raw(int32_t* raw_value)
+{
+    uint8_t data[3];
+    
+    // Read 3 bytes of ADC data
+    esp_err_t ret = nau7802_read_register(NAU7802_REG_ADCO_B2, &data[0]);
+    if (ret != ESP_OK) return ret;
+    
+    ret = nau7802_read_register(NAU7802_REG_ADCO_B1, &data[1]);
+    if (ret != ESP_OK) return ret;
+    
+    ret = nau7802_read_register(NAU7802_REG_ADCO_B0, &data[2]);
+    if (ret != ESP_OK) return ret;
+    
+    // Combine bytes into 24-bit signed value
+    int32_t result = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | (int32_t)data[2];
+    
+    // Sign extend from 24-bit to 32-bit
+    if (result & 0x800000) {
+        result |= 0xFF000000;
+    }
+    
+    // Range validation for disconnected strain gauge detection
+    // NAU7802 with 128x gain should produce readings roughly in range ±2M for connected load cells
+    // Readings near the rails (±8M) or exactly 0x000000/0xFFFFFF often indicate floating inputs
+    if (result == 0x000000 || result == 0xFFFFFF || result == -1 || 
+        result > 6000000 || result < -6000000) {
+        ESP_LOGD(TAG_NAU7802, "ADC reading out of expected range: %ld (possible disconnect)", result);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    
+    *raw_value = result;
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_select_channel(nau7802_channel_t channel)
+{
+    uint8_t ctrl2_val;
+    esp_err_t ret = nau7802_read_register(NAU7802_REG_CTRL2, &ctrl2_val);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    if (channel == NAU7802_CHANNEL_2) {
+        ctrl2_val |= NAU7802_CTRL2_CHS;  // Set channel select bit for channel 2
+    } else {
+        ctrl2_val &= ~NAU7802_CTRL2_CHS; // Clear channel select bit for channel 1
+    }
+    
+    return nau7802_write_register(NAU7802_REG_CTRL2, ctrl2_val);
+}
+
+static esp_err_t nau7802_wait_for_data_ready(uint32_t timeout_ms)
+{
+    uint32_t start_time = esp_timer_get_time() / 1000;
+    
+    while ((esp_timer_get_time() / 1000 - start_time) < timeout_ms) {
+        if (nau7802_is_data_ready()) {
+            uint32_t actual_time = esp_timer_get_time() / 1000 - start_time;
+            // Enable timing diagnostics for calibration
+            ESP_LOGD(TAG_NAU7802, "Data ready in %lu ms", actual_time);
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    return ESP_ERR_TIMEOUT;
+}
+
+static bool nau7802_is_data_ready(void)
+{
+    uint8_t status;
+    if (nau7802_read_register(NAU7802_REG_PU_CTRL, &status) == ESP_OK) {
+        return (status & NAU7802_PU_CTRL_CR) != 0;
+    }
+    return false;
+}
+
+static float nau7802_raw_to_weight(int32_t raw_value, nau7802_calibration_t* cal)
+{
+    // Additional validation - raw values should be reasonable for strain gauges
+    // Extreme values near ADC rails often indicate disconnected sensors
+    if (raw_value > 6000000 || raw_value < -6000000) {
+        ESP_LOGD(TAG_NAU7802, "Raw value %ld out of operational range", raw_value);
+        return -999.0f; // Invalid weight marker
+    }
+    
+    if (!cal->is_calibrated) {
+        // Return raw value scaled down if not calibrated
+        return (float)(raw_value - cal->zero_offset) / 1000.0f;
+    }
+    
+    // Apply calibration: weight = (raw - offset) / scale_factor
+    float weight = (float)(raw_value - cal->zero_offset) / cal->scale_factor;
+    
+    // Sanity check on calculated weight - should be reasonable for coffee applications
+    // Negative weights beyond reasonable tare range or extremely large weights suggest problems
+    if (weight < -1000.0f || weight > 10000.0f) {
+        ESP_LOGD(TAG_NAU7802, "Calculated weight %.2fg out of reasonable range", weight);
+        return -999.0f; // Invalid weight marker
+    }
+    
+    return weight;
+}
+
+static esp_err_t nau7802_perform_calibration(void)
+{
+    ESP_LOGI(TAG_NAU7802, "Performing internal calibration");
+    
+    // Start internal calibration
+    uint8_t ctrl2_val;
+    esp_err_t ret = nau7802_read_register(NAU7802_REG_CTRL2, &ctrl2_val);
+    if (ret != ESP_OK) return ret;
+    
+    ctrl2_val |= NAU7802_CTRL2_CALS;  // Start calibration
+    ret = nau7802_write_register(NAU7802_REG_CTRL2, ctrl2_val);
+    if (ret != ESP_OK) return ret;
+    
+    // Wait for calibration to complete
+    uint32_t timeout = 1000;  // 1 second timeout
+    while (timeout--) {
+        ret = nau7802_read_register(NAU7802_REG_CTRL2, &ctrl2_val);
+        if (ret == ESP_OK && !(ctrl2_val & NAU7802_CTRL2_CALS)) {
+            // Check for calibration error
+            if (ctrl2_val & NAU7802_CTRL2_CAL_ERROR) {
+                ESP_LOGE(TAG_NAU7802, "Calibration error detected");
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            ESP_LOGI(TAG_NAU7802, "Internal calibration completed successfully");
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    ESP_LOGE(TAG_NAU7802, "Calibration timeout");
+    return ESP_ERR_TIMEOUT;
+}
+
+// Rotary encoder event handler for tare functionality
+static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position, int32_t delta)
+{
+    (void)position;  // Unused parameter
+    (void)delta;     // Unused parameter
+    
+    if (event == ROTARY_EVENT_LONG_PRESS) {
+        ESP_LOGI(TAG_NAU7802, "Rotary encoder long press detected - taring scale...");
+        
+        bool any_tared = false;
+        
+        // Only tare connected channels
+        if (channel_a_connected) {
+            esp_err_t ret_a = nau7802_tare_channel(NAU7802_CHANNEL_1);
+            if (ret_a == ESP_OK) {
+                ESP_LOGI(TAG_NAU7802, "Channel A (Container) tared successfully");
+                any_tared = true;
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Failed to tare Channel A: %s", esp_err_to_name(ret_a));
+            }
+        }
+        
+        if (channel_b_connected) {
+            esp_err_t ret_b = nau7802_tare_channel(NAU7802_CHANNEL_2);
+            if (ret_b == ESP_OK) {
+                ESP_LOGI(TAG_NAU7802, "Channel B (Dosage Cup) tared successfully");
+                any_tared = true;
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Failed to tare Channel B: %s", esp_err_to_name(ret_b));
+            }
+        }
+        
+        if (any_tared) {
+            ESP_LOGI(TAG_NAU7802, "✓ Scale tared - all connected channels zeroed");
+            // Send brief tare confirmation to display
+            display_send_system_status("SCALE TARED", false);
+            
+            // Force immediate weight display update after taring (should show near zero)
+            int display_container_weight = channel_a_connected ? 0 : -999;  // Should be near zero after tare
+            int display_dosage_weight = -999;  // Channel B disabled for now
+            display_send_coffee_info((float)display_dosage_weight, (float)display_container_weight, false);
+        } else if (!channel_a_connected && !channel_b_connected) {
+            ESP_LOGW(TAG_NAU7802, "No strain gauges connected - cannot tare scale");
+            // Send error message to display
+            display_send_system_status("NO SCALE", true);
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to tare any connected channels");
+            // Send error message to display
+            display_send_system_status("TARE FAILED", true);
+        }
+    }
+}
+
+// Public API Functions
+esp_err_t nau7802_get_data(nau7802_data_t* data)
+{
+    if (data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(data, &nau7802_data, sizeof(nau7802_data_t));
+        xSemaphoreGive(nau7802_data_mutex);
+        return ESP_OK;
+    }
+
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t nau7802_get_channel_data(nau7802_channel_t channel, nau7802_channel_data_t* data)
+{
+    if (data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (channel == NAU7802_CHANNEL_1) {
+            memcpy(data, &nau7802_data.channel_a, sizeof(nau7802_channel_data_t));
+        } else {
+            memcpy(data, &nau7802_data.channel_b, sizeof(nau7802_channel_data_t));
+        }
+        xSemaphoreGive(nau7802_data_mutex);
+        return ESP_OK;
+    }
+
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
+{
+    ESP_LOGI(TAG_NAU7802, "Taring channel %d", channel);
+    
+    nau7802_calibration_t* cal = (channel == NAU7802_CHANNEL_1) ? &channel_a_cal : &channel_b_cal;
+    nau7802_channel_data_t* ch_data = (channel == NAU7802_CHANNEL_1) ? &nau7802_data.channel_a : &nau7802_data.channel_b;
+    
+    if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        cal->zero_offset = ch_data->raw_value;
+        xSemaphoreGive(nau7802_data_mutex);
+        ESP_LOGI(TAG_NAU7802, "Channel %d tared with offset %ld", channel, cal->zero_offset);
+        return ESP_OK;
+    }
+    
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t nau7802_set_gain(nau7802_gain_t gain)
+{
+    uint8_t ctrl1_val;
+    esp_err_t ret = nau7802_read_register(NAU7802_REG_CTRL1, &ctrl1_val);
+    if (ret != ESP_OK) return ret;
+    
+    ctrl1_val = (ctrl1_val & ~NAU7802_CTRL1_GAINS) | ((uint8_t)gain & NAU7802_CTRL1_GAINS);
+    ret = nau7802_write_register(NAU7802_REG_CTRL1, ctrl1_val);
+    
+    if (ret == ESP_OK) {
+        current_gain = gain;
+        ESP_LOGI(TAG_NAU7802, "Gain set to %dx", 1 << gain);
+    }
+    
+    return ret;
+}
+
+esp_err_t nau7802_set_sample_rate(nau7802_rate_t rate)
+{
+    uint8_t ctrl2_val;
+    esp_err_t ret = nau7802_read_register(NAU7802_REG_CTRL2, &ctrl2_val);
+    if (ret != ESP_OK) return ret;
+    
+    ctrl2_val = (ctrl2_val & ~NAU7802_CTRL2_CRS) | (((uint8_t)rate << 4) & NAU7802_CTRL2_CRS);
+    ret = nau7802_write_register(NAU7802_REG_CTRL2, ctrl2_val);
+    
+    if (ret == ESP_OK) {
+        current_rate = rate;
+        const uint16_t rates[] = {10, 20, 40, 80};
+        ESP_LOGI(TAG_NAU7802, "Sample rate set to %d SPS", rates[rate]);
+    }
+    
+    return ret;
+}
+
+esp_err_t nau7802_task_stop(void)
+{
+    if (!nau7802_task_running) {
+        return ESP_OK;
+    }
+
+    nau7802_task_running = false;
+
+    // Wait for task to finish
+    if (nau7802_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        nau7802_task_handle = NULL;
+    }
+
+    // Clean up mutex
+    if (nau7802_data_mutex != NULL) {
+        vSemaphoreDelete(nau7802_data_mutex);
+        nau7802_data_mutex = NULL;
+    }
+
+    ESP_LOGI(TAG_NAU7802, "NAU7802 task stopped");
+    return ESP_OK;
+}
+
+// Timing calibration function - call this to find optimal timeout values
+static void nau7802_calibrate_timing(int num_samples)
+{
+    ESP_LOGI(TAG_NAU7802, "Starting timing calibration with %d samples...", num_samples);
+    
+    uint32_t total_time_ch1 = 0;
+    uint32_t total_time_ch2 = 0;
+    uint32_t successful_ch1 = 0;
+    uint32_t successful_ch2 = 0;
+    uint32_t max_time_ch1 = 0;
+    uint32_t max_time_ch2 = 0;
+    
+    for (int i = 0; i < num_samples; i++) {
+        // Test Channel 1
+        esp_err_t ret = nau7802_select_channel(NAU7802_CHANNEL_1);
+        if (ret == ESP_OK) {
+            uint32_t start_time = esp_timer_get_time() / 1000;
+            ret = nau7802_wait_for_data_ready(100);  // Use generous timeout for calibration
+            if (ret == ESP_OK) {
+                uint32_t time_taken = esp_timer_get_time() / 1000 - start_time;
+                total_time_ch1 += time_taken;
+                successful_ch1++;
+                if (time_taken > max_time_ch1) max_time_ch1 = time_taken;
+                
+                int32_t raw_value;
+                nau7802_read_adc_raw(&raw_value);  // Actually read the value
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5));
+        
+        // Test Channel 2
+        ret = nau7802_select_channel(NAU7802_CHANNEL_2);
+        if (ret == ESP_OK) {
+            uint32_t start_time = esp_timer_get_time() / 1000;
+            ret = nau7802_wait_for_data_ready(100);  // Use generous timeout for calibration
+            if (ret == ESP_OK) {
+                uint32_t time_taken = esp_timer_get_time() / 1000 - start_time;
+                total_time_ch2 += time_taken;
+                successful_ch2++;
+                if (time_taken > max_time_ch2) max_time_ch2 = time_taken;
+                
+                int32_t raw_value;
+                nau7802_read_adc_raw(&raw_value);  // Actually read the value
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));  // Brief pause between samples
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "=== TIMING CALIBRATION RESULTS ===");
+    ESP_LOGI(TAG_NAU7802, "Channel 1: %lu/%d successful reads", successful_ch1, num_samples);
+    if (successful_ch1 > 0) {
+        ESP_LOGI(TAG_NAU7802, "  Average time: %lu ms", total_time_ch1 / successful_ch1);
+        ESP_LOGI(TAG_NAU7802, "  Maximum time: %lu ms", max_time_ch1);
+        ESP_LOGI(TAG_NAU7802, "  Recommended timeout: %lu ms", max_time_ch1 + 10);
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "Channel 2: %lu/%d successful reads", successful_ch2, num_samples);
+    if (successful_ch2 > 0) {
+        ESP_LOGI(TAG_NAU7802, "  Average time: %lu ms", total_time_ch2 / successful_ch2);
+        ESP_LOGI(TAG_NAU7802, "  Maximum time: %lu ms", max_time_ch2);
+        ESP_LOGI(TAG_NAU7802, "  Recommended timeout: %lu ms", max_time_ch2 + 10);
+    }
+    
+    uint32_t overall_max = (max_time_ch1 > max_time_ch2) ? max_time_ch1 : max_time_ch2;
+    ESP_LOGI(TAG_NAU7802, "Overall recommended timeout: %lu ms", overall_max + 10);
+    ESP_LOGI(TAG_NAU7802, "=== END CALIBRATION RESULTS ===");
+}
+
+// Public function to run timing calibration - add to header if you want to call it externally
+esp_err_t nau7802_run_timing_calibration(int num_samples)
+{
+    if (!nau7802_task_running) {
+        ESP_LOGE(TAG_NAU7802, "NAU7802 task not running, cannot calibrate");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    nau7802_calibrate_timing(num_samples);
+    return ESP_OK;
+}
+
+// Test different timeout values to find optimal settings
+esp_err_t nau7802_test_timeout_values(uint32_t min_timeout, uint32_t max_timeout, uint32_t step_timeout, uint32_t* optimal_timeout)
+{
+    if (!nau7802_task_running) {
+        ESP_LOGE(TAG_NAU7802, "NAU7802 task not running, cannot test");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (optimal_timeout == NULL) {
+        ESP_LOGE(TAG_NAU7802, "optimal_timeout parameter cannot be NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "Testing timeout values from %lu to %lu ms (step: %lu ms)", 
+             min_timeout, max_timeout, step_timeout);
+    
+    uint32_t best_timeout = max_timeout;  // Default to max if no optimal found
+    float best_avg_time = 999.0f;  // Track the fastest successful timeout
+    
+    for (uint32_t timeout = min_timeout; timeout <= max_timeout; timeout += step_timeout) {
+        uint32_t successful_reads = 0;
+        uint32_t total_attempts = 10;
+        uint32_t total_time = 0;
+        
+        ESP_LOGI(TAG_NAU7802, "Testing timeout: %lu ms", timeout);
+        
+        for (uint32_t i = 0; i < total_attempts; i++) {
+            // Test Channel A
+            esp_err_t ret = nau7802_select_channel(NAU7802_CHANNEL_1);
+            if (ret == ESP_OK) {
+                uint32_t start_time = esp_timer_get_time() / 1000;
+                ret = nau7802_wait_for_data_ready(timeout);
+                if (ret == ESP_OK) {
+                    uint32_t actual_time = esp_timer_get_time() / 1000 - start_time;
+                    total_time += actual_time;
+                    successful_reads++;
+                    
+                    int32_t raw_value;
+                    nau7802_read_adc_raw(&raw_value);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(30));  // Wait for next sample cycle
+        }
+        
+        float success_rate = (float)successful_reads / total_attempts * 100.0f;
+        float avg_time = successful_reads > 0 ? (float)total_time / successful_reads : 999.0f;
+        
+        ESP_LOGI(TAG_NAU7802, "  Timeout %lu ms: %.1f%% success, avg time: %.1f ms", 
+                 timeout, success_rate, avg_time);
+        
+        // If we achieve 100% success, this is a candidate for optimal timeout
+        if (success_rate >= 100.0f) {
+            if (avg_time < best_avg_time) {
+                best_timeout = timeout;
+                best_avg_time = avg_time;
+            }
+            ESP_LOGI(TAG_NAU7802, "  ✓ 100%% success with %.1f ms avg time", avg_time);
+            
+            // If this timeout is very close to the actual timing, we found our optimum
+            if (timeout <= (uint32_t)(avg_time * 1.5f)) {
+                ESP_LOGI(TAG_NAU7802, "  ✓ OPTIMAL: %lu ms is ideal (only %.1fx actual time)", 
+                         timeout, (float)timeout / avg_time);
+                best_timeout = timeout;
+                break;
+            }
+        }
+    }
+    
+    *optimal_timeout = best_timeout;
+    ESP_LOGI(TAG_NAU7802, "=== OPTIMAL TIMEOUT FOUND: %lu ms (avg actual: %.1f ms) ===", 
+             best_timeout, best_avg_time);
+    
+    return ESP_OK;
+}
+
+// Get the current optimal timeout value
+uint32_t nau7802_get_optimal_timeout(void)
+{
+    return optimal_timeout_ms;
+}
+
+// Recalibrate the optimal timeout during runtime
+esp_err_t nau7802_recalibrate_timeout(void)
+{
+    if (!nau7802_task_running) {
+        ESP_LOGE(TAG_NAU7802, "NAU7802 task not running, cannot recalibrate");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    ESP_LOGI(TAG_NAU7802, "Recalibrating timeout values...");
+    
+    uint32_t new_timeout = 100;  // Default fallback
+    esp_err_t ret = nau7802_test_timeout_values(20, 200, 10, &new_timeout);
+    
+    if (ret == ESP_OK) {
+        optimal_timeout_ms = new_timeout;
+        timeout_calibrated = true;
+        ESP_LOGI(TAG_NAU7802, "Timeout recalibrated to: %lu ms", optimal_timeout_ms);
+    } else {
+        ESP_LOGW(TAG_NAU7802, "Timeout recalibration failed, keeping current: %lu ms", optimal_timeout_ms);
+    }
+    
+    return ret;
+}

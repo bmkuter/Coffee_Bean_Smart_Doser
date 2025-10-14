@@ -22,6 +22,7 @@
 #include "led_task.h"
 #include "rotary_encoder_task.h"
 #include "display_task.h"
+#include "nau7802_task.h"
 
 static void initialize_system(void)
 {
@@ -53,6 +54,13 @@ static void initialize_peripherals(void)
         return;
     }
     
+    // Initialize NAU7802 ADC task (manages its own I2C)
+    ret = nau7802_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "Failed to initialize NAU7802 task: %s", esp_err_to_name(ret));
+        return;
+    }
+    
     // Start rotary encoder task
     ret = rotary_encoder_task_start();
     if (ret != ESP_OK) {
@@ -66,9 +74,16 @@ static void initialize_peripherals(void)
         ESP_LOGE(TAG_MAIN, "Failed to start display task: %s", esp_err_to_name(ret));
         return;
     }
+
+    // Start NAU7802 task
+    ret = nau7802_task_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "Failed to start NAU7802 task: %s", esp_err_to_name(ret));
+        return;
+    }
     
     ESP_LOGI(TAG_MAIN, "Peripheral initialization complete");
-    ESP_LOGI(TAG_MAIN, "Direct I2C hardware access with rotary encoder and display tasks running");
+    ESP_LOGI(TAG_MAIN, "Direct I2C hardware access with rotary encoder, display, and NAU7802 ADC tasks running");
 }
 
 static void log_system_info(void)
