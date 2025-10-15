@@ -42,13 +42,13 @@ static uint32_t channel_b_consecutive_errors = 0;
 // I2C device handle
 static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
 
-// Calibration data for both channels
-static nau7802_calibration_t channel_a_cal = {0, 0.623f, false};  // Calibrated for 1x gain (223 counts / 358g)
-static nau7802_calibration_t channel_b_cal = {0, 0.623f, false};  // Calibrated for 1x gain (223 counts / 358g)
+// Calibration data for both channels  
+static nau7802_calibration_t channel_a_cal = {0, 10.44f, false};  // Corrected based on 358g weight test
+static nau7802_calibration_t channel_b_cal = {0, 10.44f, false};  // Corrected based on 358g weight test
 
 // Configuration
 static nau7802_gain_t current_gain = NAU7802_GAIN_1X;  // Maximum stability with lowest gain
-static nau7802_rate_t current_rate = NAU7802_RATE_20SPS;
+static nau7802_rate_t current_rate = NAU7802_RATE_40SPS;
 
 // Dynamic timeout optimization
 static uint32_t optimal_timeout_ms = 100;  // Default timeout, will be calibrated
@@ -896,19 +896,62 @@ esp_err_t nau7802_get_channel_data(nau7802_channel_t channel, nau7802_channel_da
 
 esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
 {
-    ESP_LOGI(TAG_NAU7802, "Taring channel %d", channel);
+    ESP_LOGI(TAG_NAU7802, "Taring channel %d - collecting 500ms of stable readings...", channel);
     
+    // Show "Scale Taring..." message on display
+    display_send_system_status("Scale Taring...", false);
+
+    // Delay for physical stability 
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     nau7802_calibration_t* cal = (channel == NAU7802_CHANNEL_1) ? &channel_a_cal : &channel_b_cal;
     nau7802_channel_data_t* ch_data = (channel == NAU7802_CHANNEL_1) ? &nau7802_data.channel_a : &nau7802_data.channel_b;
     
+    // Collect multiple readings over 1 sec for stable tare
+    const int num_samples = 20;  // 20 samples over 1 sec = 50ms per sample
+    int32_t tare_samples[num_samples];
+    int valid_samples = 0;
+    
+    for (int i = 0; i < num_samples; i++) {
+        // Wait for data ready with timeout
+        esp_err_t ret = nau7802_select_channel(channel);
+        if (ret == ESP_OK) {
+            ret = nau7802_wait_for_data_ready(100);  // 100ms timeout per sample
+            if (ret == ESP_OK) {
+                int32_t raw_value;
+                ret = nau7802_read_adc_raw(&raw_value);
+                if (ret == ESP_OK) {
+                    tare_samples[valid_samples] = raw_value;
+                    valid_samples++;
+                    ESP_LOGD(TAG_NAU7802, "Tare sample %d: %ld", valid_samples, raw_value);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // 50ms between samples
+    }
+    
+    if (valid_samples < 5) {
+        ESP_LOGE(TAG_NAU7802, "Insufficient stable readings for tare (%d/10)", valid_samples);
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // Calculate average of collected samples
+    int64_t sum = 0;
+    for (int i = 0; i < valid_samples; i++) {
+        sum += tare_samples[i];
+    }
+    int32_t averaged_tare = (int32_t)(sum / valid_samples);
+    
+    ESP_LOGI(TAG_NAU7802, "Tare average from %d samples: %ld", valid_samples, averaged_tare);
+    
     if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        cal->zero_offset = ch_data->raw_value;
+        cal->zero_offset = averaged_tare;  // Use averaged value instead of single reading
         
         // Force complete filter reinitialization when taring
         ch_data->kf.initialized = false;  // Force Kalman filter to reinitialize
         
         // Reset moving average buffer 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 20; i++) {  // Updated to match new buffer size
             ch_data->avg_buffer[i] = 0.0f;  // Reset to zero weight
         }
         ch_data->avg_index = 0;
@@ -926,7 +969,7 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
         ESP_LOGI(TAG_NAU7802, "Channel %d all filters reset for clean tare", channel);
         
         xSemaphoreGive(nau7802_data_mutex);
-        ESP_LOGI(TAG_NAU7802, "Channel %d tared with offset %ld", channel, cal->zero_offset);
+        ESP_LOGI(TAG_NAU7802, "Channel %d tared with averaged offset %ld", channel, cal->zero_offset);
         
         // Save tare values to NVS for persistence across reboots
         esp_err_t save_ret = nau7802_save_tare_values();
@@ -936,9 +979,14 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
             ESP_LOGW(TAG_NAU7802, "Failed to save tare values to flash: %s", esp_err_to_name(save_ret));
         }
         
+        // Show "Scale Tared!" success message
+        display_send_system_status("Scale Tared!", false);
+        
         return ESP_OK;
     }
     
+    // Show error message if tare failed
+    display_send_system_status("Tare Failed!", true);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -1201,7 +1249,7 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
     
     // Apply simple moving average for additional smoothing
     ch_data->avg_buffer[ch_data->avg_index] = raw_weight;
-    ch_data->avg_index = (ch_data->avg_index + 1) % 5;
+    ch_data->avg_index = (ch_data->avg_index + 1) % 10;
     if (!ch_data->avg_filled && ch_data->avg_index == 0) {
         ch_data->avg_filled = true;
     }
@@ -1209,10 +1257,10 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
     // Calculate moving average if buffer has enough samples
     if (ch_data->avg_filled) {
         float sum = 0.0f;
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 10; i++) {
             sum += ch_data->avg_buffer[i];
         }
-        raw_weight = sum / 5.0f;  // Use 5-sample moving average
+        raw_weight = sum / 10.0f;  // Use 10-sample moving average for balanced performance
     }
     
     // Debug logging for calibration (remove once calibrated)
@@ -1221,13 +1269,13 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         ESP_LOGI(TAG_NAU7802, "Calibration debug: raw=%ld, offset=%ld, scale=%.1f, raw_weight=%.2fg", 
                  raw_value, cal->zero_offset, cal->scale_factor, raw_weight);
     }
-    
+
     // Initialize Kalman filter if not done yet
     if (!ch_data->kf.initialized) {
-        // Ultra-conservative parameters for rock-solid static stability
-        float process_noise = 0.1f;      // Extremely low - assumes weight barely changes
-        float measurement_noise = 0.5f;  // Low - high trust in stable measurements
-        float dt = 0.15f;                // 150ms between samples (6.7 Hz effective rate)
+        // More responsive parameters for faster settling during weight changes
+        float process_noise = 25.0f;       // Higher process noise for faster response
+        float measurement_noise = 2.0f;    // Still trust measurements, but allow more adaptation
+        float dt = 0.025f;                 // 40 SPS = 25ms intervals
         
         nau7802_kalman_init(&ch_data->kf, process_noise, measurement_noise, dt);
         
@@ -1246,17 +1294,33 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         ch_data->avg_index = 0;
         ch_data->avg_filled = true;
         
-        ESP_LOGI(TAG_NAU7802, "Kalman filter initialized with conservative parameters");
+        ESP_LOGI(TAG_NAU7802, "Kalman filter initialized - dt: %.3fs, process_noise: %.1f, measurement_noise: %.1f", 
+                 dt, process_noise, measurement_noise);
         return raw_weight;
     }
     
-    // Bypass Kalman filter - use simple moving average for stable output
-    ch_data->filtered_weight = raw_weight;  // Use the averaged weight directly
-    ch_data->velocity = 0.0f;               // Zero velocity for static readings
-    ch_data->acceleration = 0.0f;           // Zero acceleration for static readings
-    ch_data->confidence = 1.0f;             // Full confidence in averaged readings
-    
-    return raw_weight;  // Return the moving averaged weight directly
+    // Update Kalman filter with moving averaged measurement
+    esp_err_t ret = nau7802_kalman_update(&ch_data->kf, raw_weight, timestamp_ms);
+    if (ret == ESP_OK) {
+        // Extract filtered values from Kalman filter
+        ch_data->filtered_weight = ch_data->kf.state[0];
+        ch_data->velocity = ch_data->kf.state[1];
+        ch_data->acceleration = ch_data->kf.state[2];
+        
+        // Calculate confidence based on innovation and measurement consistency
+        float innovation = fabsf(raw_weight - ch_data->filtered_weight);
+        float max_innovation = 5.0f;  // 5g maximum expected innovation for good confidence (tighter with better scale factor)
+        ch_data->confidence = fmaxf(0.0f, fminf(1.0f, 1.0f - (innovation / max_innovation)));
+        
+        // Ground the scale at 0g - prevent any negative readings and small positive noise
+        float final_weight = fmaxf(0.0f, floorf(ch_data->filtered_weight));
+        
+        return final_weight;  // Return grounded Kalman-filtered weight
+    } else {
+        // Fallback to moving average if Kalman update fails
+        float final_weight = fmaxf(0.0f, floorf(raw_weight));
+        return final_weight;
+    }
 }
 
 esp_err_t nau7802_task_stop(void)
