@@ -202,8 +202,51 @@ static void motor_process_command(motor_command_t* cmd)
     switch (cmd->command) {
         case MOTOR_CMD_DISPENSE:
             ESP_LOGI(TAG_MOTOR, "DISPENSE command received (from double-click) - parameter=%lu", cmd->parameter);
-            // TODO: Implement dispensing logic
-            // This will eventually drive the stepper motor
+            ESP_LOGI(TAG_MOTOR, "Starting PWM sweep test for DC motor M3 (air pump)");
+            ESP_LOGI(TAG_MOTOR, "M3 uses PCA9685 channels: PWM=%d, IN1=%d, IN2=%d", 
+                     MOTOR_M3_PWM, MOTOR_M3_IN1, MOTOR_M3_IN2);
+            
+            // Set direction for M3: IN1=HIGH, IN2=LOW for forward
+            ESP_LOGI(TAG_MOTOR, "Setting M3 direction: IN1=HIGH, IN2=LOW (forward)");
+            motor_set_pin(MOTOR_M3_IN1, true);   // Channel 4 = HIGH
+            motor_set_pin(MOTOR_M3_IN2, false);  // Channel 3 = LOW
+            
+            // PWM sweep from 0% to 100% in 10% increments
+            ESP_LOGI(TAG_MOTOR, "Starting PWM ramp UP (0%% to 100%%)");
+            for (int duty_percent = 0; duty_percent <= 100; duty_percent += 10) {
+                uint16_t pwm_value = (duty_percent * 4095) / 100;  // Convert percentage to 12-bit value
+                
+                ESP_LOGI(TAG_MOTOR, "M3 PWM: %d%% (value=%d/4095 on channel %d)", 
+                         duty_percent, pwm_value, MOTOR_M3_PWM);
+                esp_err_t ret = motor_set_pwm(MOTOR_M3_PWM, pwm_value);  // Channel 2
+                
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG_MOTOR, "Failed to set PWM: %s", esp_err_to_name(ret));
+                } else {
+                    ESP_LOGD(TAG_MOTOR, "PWM set successfully");
+                }
+                
+                // Hold each PWM level for 500ms so we can observe/hear the change
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            
+            // Sweep back down from 100% to 0%
+            ESP_LOGI(TAG_MOTOR, "Starting PWM ramp DOWN (100%% to 0%%)");
+            for (int duty_percent = 100; duty_percent >= 0; duty_percent -= 10) {
+                uint16_t pwm_value = (duty_percent * 4095) / 100;
+                
+                ESP_LOGI(TAG_MOTOR, "M3 PWM: %d%% (value=%d/4095)", duty_percent, pwm_value);
+                motor_set_pwm(MOTOR_M3_PWM, pwm_value);
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            
+            // Turn off motor completely
+            ESP_LOGI(TAG_MOTOR, "Releasing M3 motor (all channels OFF)");
+            motor_set_pwm(MOTOR_M3_PWM, 0);
+            motor_set_pin(MOTOR_M3_IN1, false);
+            motor_set_pin(MOTOR_M3_IN2, false);
+            
+            ESP_LOGI(TAG_MOTOR, "PWM sweep test completed");
             break;
             
         case MOTOR_CMD_STOP:
