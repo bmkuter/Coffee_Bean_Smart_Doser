@@ -28,6 +28,11 @@ extern "C" {
 #define DISPLAY_UPDATE_RATE_MS      100      // 10 FPS update rate
 #define DISPLAY_MESSAGE_QUEUE_SIZE  64       // Larger buffer for display updates (was 0x20/32)
 
+// Weight Display Error Codes (float values, grams can never be negative in normal operation)
+#define WEIGHT_DISPLAY_NO_CONN      -999.0f  // Strain gauge not connected
+#define WEIGHT_DISPLAY_TARING       -998.0f  // Tare operation in progress
+// Note: Any negative weight indicates an error state since grams cannot be negative
+
 // Display Message Types
 typedef enum {
     DISPLAY_MSG_ENCODER_UPDATE,

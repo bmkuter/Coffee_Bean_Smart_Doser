@@ -53,7 +53,7 @@ static void initialize_peripherals(void)
         ESP_LOGE(TAG_MAIN, "Failed to initialize display task: %s", esp_err_to_name(ret));
         return;
     }
-    
+
     // Initialize NAU7802 ADC task (manages its own I2C)
     ret = nau7802_task_init();
     if (ret != ESP_OK) {
@@ -101,8 +101,8 @@ static void log_system_info(void)
 
 void app_main(void)
 {
-    // Pause for 100 ms to allow system stabilization
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // // Pause for 100 ms to allow system stabilization
+    // vTaskDelay(pdMS_TO_TICKS(1000));
 
     // Log system information
     log_system_info();
@@ -112,16 +112,6 @@ void app_main(void)
     
     // Initialize peripherals first (now handles I2C power)
     initialize_peripherals();
-
-    // // Create LED task for status indication
-    // xTaskCreate(
-    //     led_task,
-    //     "led_task",
-    //     LED_TASK_STACK_SIZE,
-    //     NULL,
-    //     LED_TASK_PRIORITY,
-    //     NULL
-    // );
 
     ESP_LOGI(TAG_MAIN, "Coffee Bean Smart Doser started successfully!");
     ESP_LOGI(TAG_MAIN, "System is ready for peripheral integration...");

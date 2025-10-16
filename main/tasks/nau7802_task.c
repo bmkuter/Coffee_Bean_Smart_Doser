@@ -39,6 +39,9 @@ static uint32_t channel_a_consecutive_errors = 0;
 static uint32_t channel_b_consecutive_errors = 0;
 #define MAX_CONSECUTIVE_ERRORS 5  // Consider disconnected after 5 consecutive errors
 
+// Tare operation tracking
+static volatile bool tare_in_progress = false;  // Flag to indicate tare operation in progress
+
 // I2C device handle
 static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
 
@@ -123,6 +126,11 @@ esp_err_t nau7802_task_init(void)
     memset(&nau7802_data, 0, sizeof(nau7802_data_t));
     nau7802_data.device_ready = true;
 
+    // Send initial display update AFTER loading tare values
+    // Channel B disabled (NO_CONN), Channel A will show 0g initially
+    display_send_coffee_info(WEIGHT_DISPLAY_NO_CONN, 0.0f, false);
+    ESP_LOGI(TAG_NAU7802, "Sent initial display update - weights will update once measurements begin");
+
     // Register callback with rotary encoder for tare functionality
     ret = rotary_encoder_register_callback(nau7802_rotary_event_handler);
     if (ret != ESP_OK) {
@@ -191,11 +199,6 @@ static void nau7802_task_function(void* pvParameters)
     uint32_t channel_b_samples = 0;
     uint32_t error_count = 0;
     uint32_t last_error_log = 0;
-
-    // Send initial display update to show "0g" instead of "-----g"
-    // This ensures the display shows weight immediately on startup
-    display_send_coffee_info(-999.0f, 0.0f, false);  // Start with 0g container weight
-    ESP_LOGI(TAG_NAU7802, "Sent initial display update to show 0g");
 
     // Calibrate optimal timeout on startup
     // uint32_t calibrated_timeout = 100;  // Default fallback
@@ -274,75 +277,84 @@ static void nau7802_task_function(void* pvParameters)
         }
 
         // Send display update with current weight readings (rounded to integers)
-        int display_container_weight = channel_a_connected ? (int)round(nau7802_data.channel_a.weight_grams) : -999;
-        int display_dosage_weight = -999;  // Channel B disabled for now
+        // Show TARING indicator during tare operation to avoid confusing fluctuations
+        int display_container_weight, display_dosage_weight;
+        
+        if (tare_in_progress) {
+            // During tare, show "----" instead of fluctuating values
+            display_container_weight = (int)WEIGHT_DISPLAY_TARING;
+            display_dosage_weight = (int)WEIGHT_DISPLAY_TARING;
+        } else {
+            // Normal operation - show actual weights or NO_CONN if disconnected
+            display_container_weight = channel_a_connected ? (int)round(nau7802_data.channel_a.weight_grams) : (int)WEIGHT_DISPLAY_NO_CONN;
+            display_dosage_weight = channel_b_connected ? (int)round(nau7802_data.channel_b.weight_grams) : (int)WEIGHT_DISPLAY_NO_CONN;
+        }
         
         // Send display update to show current weights
         display_send_coffee_info((float)display_dosage_weight, (float)display_container_weight, false);
 
-        // // Small delay between channel reads (important for strain gauge settling)
-        // vTaskDelay(pdMS_TO_TICKS(10));  // Increased for better strain gauge stability
+        // Small delay between channel reads (important for strain gauge settling)
+        vTaskDelay(pdMS_TO_TICKS(10));  // Increased for better strain gauge stability
 
-        // // Read Channel B (Dosage Cup Weight)
-        // ret = nau7802_select_channel(NAU7802_CHANNEL_2);
-        // if (ret == ESP_OK) {
-        //     ret = nau7802_wait_for_data_ready(optimal_timeout_ms);  // Use calibrated timeout  // Consistent timeout for 40 SPS
-        //     if (ret == ESP_OK) {
-        //         int32_t raw_value;
-        //         ret = nau7802_read_adc_raw(&raw_value);
-        //         if (ret == ESP_OK) {
-        //             // Update Channel B data
-        //             if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        //                 nau7802_data.channel_b.raw_value = raw_value;
-        //                 nau7802_data.channel_b.weight_grams = nau7802_raw_to_weight(raw_value, &channel_b_cal);
-        //                 nau7802_data.channel_b.data_ready = true;
-        //                 nau7802_data.channel_b.timestamp = esp_timer_get_time() / 1000;
-        //                 nau7802_data.channel_b.sample_count = ++channel_b_samples;
-        //                 nau7802_data.total_conversions++;
-        //                 xSemaphoreGive(nau7802_data_mutex);
+        // Read Channel B (Dosage Cup Weight)
+        ret = nau7802_select_channel(NAU7802_CHANNEL_2);
+        if (ret == ESP_OK) {
+            ret = nau7802_wait_for_data_ready(250);  // Use same timeout as Channel A
+            if (ret == ESP_OK) {
+                int32_t raw_value;
+                ret = nau7802_read_adc_raw(&raw_value);
+                if (ret == ESP_OK) {
+                    // Update Channel B data with filtered weight
+                    if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        uint32_t timestamp_ms = esp_timer_get_time() / 1000;
+                        
+                        nau7802_data.channel_b.raw_value = raw_value;
+                        nau7802_data.channel_b.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_b_cal, &nau7802_data.channel_b, timestamp_ms);
+                        nau7802_data.channel_b.data_ready = true;
+                        nau7802_data.channel_b.timestamp = timestamp_ms;
+                        nau7802_data.channel_b.sample_count = ++channel_b_samples;
+                        nau7802_data.total_conversions++;
+                        xSemaphoreGive(nau7802_data_mutex);
 
-        //                 // Check if the weight value indicates a disconnected sensor
-        //                 if (nau7802_data.channel_b.weight_grams < -900.0f) {
-        //                     ESP_LOGW(TAG_NAU7802, "Channel B: invalid weight %.2fg indicates disconnection", 
-        //                              nau7802_data.channel_b.weight_grams);
-        //                     channel_b_consecutive_errors++;
-        //                 } else {
-        //                     ESP_LOGD(TAG_NAU7802, "Channel B: raw=%ld, weight=%.2fg", raw_value, nau7802_data.channel_b.weight_grams);
-        //                     channel_b_success = true;
+                        // Check if the weight value indicates a disconnected sensor
+                        // Temporarily disabled to allow re-taring after gain change
+                        if (false && nau7802_data.channel_b.weight_grams < -900.0f) {
+                            ESP_LOGW(TAG_NAU7802, "Channel B: invalid weight %.2fg indicates disconnection", 
+                                     nau7802_data.channel_b.weight_grams);
+                            channel_b_consecutive_errors++;
+                        } else {
+                            ESP_LOGD(TAG_NAU7802, "Channel B: raw=%ld, filtered=%.0fg, velocity=%.3fg/s, accel=%.3fg/s², conf=%.2f", 
+                                     raw_value, nau7802_data.channel_b.filtered_weight,
+                                     nau7802_data.channel_b.velocity, nau7802_data.channel_b.acceleration,
+                                     nau7802_data.channel_b.confidence);
+                            channel_b_success = true;
                             
-        //                     // Reset error count and mark as connected
-        //                     channel_b_consecutive_errors = 0;
-        //                     if (!channel_b_connected) {
-        //                         channel_b_connected = true;
-        //                         ESP_LOGI(TAG_NAU7802, "Channel B strain gauge connected and responding");
-        //                     }
-        //                 }
-        //             }
-        //         } else {
-        //             ESP_LOGW(TAG_NAU7802, "Failed to read Channel B ADC data: %s", esp_err_to_name(ret));
-        //             channel_b_consecutive_errors++;
-        //         }
-        //     } else {
-        //         ESP_LOGD(TAG_NAU7802, "Channel B data ready timeout: %s", esp_err_to_name(ret));
-        //         channel_b_consecutive_errors++;
-        //     }
-        // } else {
-        //     ESP_LOGW(TAG_NAU7802, "Failed to select Channel B: %s", esp_err_to_name(ret));
-        //     channel_b_consecutive_errors++;
-        // }
+                            // Reset error count and mark as connected
+                            channel_b_consecutive_errors = 0;
+                            if (!channel_b_connected) {
+                                channel_b_connected = true;
+                                ESP_LOGI(TAG_NAU7802, "Channel B strain gauge connected and responding");
+                            }
+                        }
+                    }
+                } else {
+                    ESP_LOGW(TAG_NAU7802, "Failed to read Channel B ADC data: %s", esp_err_to_name(ret));
+                    channel_b_consecutive_errors++;
+                }
+            } else {
+                ESP_LOGD(TAG_NAU7802, "Channel B data ready timeout: %s", esp_err_to_name(ret));
+                channel_b_consecutive_errors++;
+            }
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to select Channel B: %s", esp_err_to_name(ret));
+            channel_b_consecutive_errors++;
+        }
         
-        // // Check if Channel B should be considered disconnected
-        // if (channel_b_consecutive_errors >= MAX_CONSECUTIVE_ERRORS && channel_b_connected) {
-        //     channel_b_connected = false;
-        //     ESP_LOGW(TAG_NAU7802, "Channel B strain gauge appears disconnected (errors: %lu)", channel_b_consecutive_errors);
-        // }
-
-        // // Send display update with current connection status
-        // float display_container_weight = channel_a_connected ? nau7802_data.channel_a.weight_grams : -999.0f;
-        // float display_dosage_weight = channel_b_connected ? nau7802_data.channel_b.weight_grams : -999.0f;
-        
-        // // Always send display update to ensure current status is shown
-        // display_send_coffee_info(display_dosage_weight, display_container_weight, false);
+        // Check if Channel B should be considered disconnected
+        if (channel_b_consecutive_errors >= MAX_CONSECUTIVE_ERRORS && channel_b_connected) {
+            channel_b_connected = false;
+            ESP_LOGW(TAG_NAU7802, "Channel B strain gauge appears disconnected (errors: %lu)", channel_b_consecutive_errors);
+        }
 
         // Error counting and periodic logging for overall status
         if (!channel_a_connected && !channel_b_connected) {
@@ -553,10 +565,14 @@ static esp_err_t nau7802_read_register(uint8_t reg_addr, uint8_t* value)
 {
     esp_err_t ret = i2c_master_transmit(nau7802_i2c_dev_handle, &reg_addr, 1, 1000);
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read register 0x%02X with error: %s", reg_addr, esp_err_to_name(ret));
         return ret;
     }
-    
-    return i2c_master_receive(nau7802_i2c_dev_handle, value, 1, 1000);
+    ret = i2c_master_receive(nau7802_i2c_dev_handle, value, 1, 1000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to receive data for register 0x%02X with error: %s", reg_addr, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static esp_err_t nau7802_read_adc_raw(int32_t* raw_value)
@@ -599,6 +615,7 @@ static esp_err_t nau7802_select_channel(nau7802_channel_t channel)
     uint8_t ctrl2_val;
     esp_err_t ret = nau7802_read_register(NAU7802_REG_CTRL2, &ctrl2_val);
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to read CTRL2 register with error: %s", esp_err_to_name(ret));
         return ret;
     }
     
@@ -607,8 +624,11 @@ static esp_err_t nau7802_select_channel(nau7802_channel_t channel)
     } else {
         ctrl2_val &= ~NAU7802_CTRL2_CHS; // Clear channel select bit for channel 1
     }
-    
-    return nau7802_write_register(NAU7802_REG_CTRL2, ctrl2_val);
+    ret = nau7802_write_register(NAU7802_REG_CTRL2, ctrl2_val);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to select channel %d with error: %s", channel, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static esp_err_t nau7802_wait_for_data_ready(uint32_t timeout_ms)
@@ -740,13 +760,8 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
                 ESP_LOGW(TAG_NAU7802, "Failed to reset encoder position: %s", esp_err_to_name(encoder_ret));
             }
             
-            // Send brief tare confirmation to display
-            display_send_system_status("SCALE TARED", false);
-            
-            // Force immediate weight display update after taring (should show near zero)
-            int display_container_weight = channel_a_connected ? 0 : -999;  // Should be near zero after tare
-            int display_dosage_weight = -999;  // Channel B disabled for now
-            display_send_coffee_info((float)display_dosage_weight, (float)display_container_weight, false);
+            // Note: Display will automatically update once tare_in_progress flag is cleared by tare function
+            // No need for manual display update here - the main loop will handle it
         } else if (!channel_a_connected && !channel_b_connected) {
             ESP_LOGW(TAG_NAU7802, "No strain gauges connected - cannot tare scale");
             // Send error message to display
@@ -898,8 +913,14 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
 {
     ESP_LOGI(TAG_NAU7802, "Taring channel %d - collecting 500ms of stable readings...", channel);
     
+    // Set flag to prevent display updates during tare
+    tare_in_progress = true;
+    
     // Show "Scale Taring..." message on display
     display_send_system_status("Scale Taring...", false);
+    
+    // Force display to show "----" during tare by sending taring indicator
+    display_send_coffee_info(WEIGHT_DISPLAY_TARING, WEIGHT_DISPLAY_TARING, false);
 
     // Delay for physical stability 
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -982,8 +1003,14 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
         // Show "Scale Tared!" success message
         display_send_system_status("Scale Tared!", false);
         
+        // Clear tare-in-progress flag to resume normal display updates
+        tare_in_progress = false;
+        
         return ESP_OK;
     }
+    
+    // Clear tare-in-progress flag on error too
+    tare_in_progress = false;
     
     // Show error message if tare failed
     display_send_system_status("Tare Failed!", true);

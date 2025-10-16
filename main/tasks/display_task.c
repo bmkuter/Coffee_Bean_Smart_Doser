@@ -90,13 +90,14 @@ esp_err_t display_task_init(void)
 
     // Clear display and show initial encoder display layout
     ssd1306_clear_screen(&ssd1306_dev, false);
-    ssd1306_display_text(&ssd1306_dev, 0, "Rotary Encoder", 14, false);
-    ssd1306_display_text(&ssd1306_dev, 1, "Long press=tare", 15, false);
-    ssd1306_display_text(&ssd1306_dev, 2, "Pos: 0       ", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 4, "Delta: 0     ", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 5, "Btn: ---     ", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 6, "Cont: -----g ", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 7, "Dose: -----g ", 13, false);
+
+    // Draw ASCII Coffee Bean Startup Logo
+    ssd1306_display_text(&ssd1306_dev, 1, "   .-\"\"\"\"\"-.", 11, false);
+    ssd1306_display_text(&ssd1306_dev, 2, "  /  Coffee \\", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 3, " |   Bean   |", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 4, " |   Smart  |", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 5, "  \\ Doser  /", 12, false);
+    ssd1306_display_text(&ssd1306_dev, 6, "   '-.....-'", 12, false);
 
     ESP_LOGI(TAG_DISPLAY, "Display task initialized successfully");
     return ESP_OK;
@@ -139,6 +140,23 @@ static void display_task_function(void* pvParameters)
     display_message_t message;
     TickType_t last_update = xTaskGetTickCount();
     
+    vTaskDelay(1500);  // Wait for 1.5 seconds to show startup logo & let ADC settle
+
+    // Clear display and show initial encoder display layout with actual current values
+    ssd1306_clear_screen(&ssd1306_dev, false);
+    
+    // Small delay to allow other I2C devices (NAU7802) to access the bus
+    // This prevents I2C contention during the burst of display updates
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    ssd1306_display_text(&ssd1306_dev, 0, "Rotary Encoder", 14, false);
+    ssd1306_display_text(&ssd1306_dev, 1, "Long press=tare", 15, false);
+    
+    // Populate with actual current values instead of template placeholders
+    display_refresh_main_screen();
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     while (display_task_running) {
         // Check for messages with timeout
         if (xQueueReceive(display_message_queue, &message, pdMS_TO_TICKS(DISPLAY_UPDATE_RATE_MS)) == pdTRUE) {
@@ -186,7 +204,7 @@ static void display_task_function(void* pvParameters)
         
         // Periodic refresh even without messages (every 1 second)
         TickType_t current_time = xTaskGetTickCount();
-        if ((current_time - last_update) > pdMS_TO_TICKS(1000)) {
+        if ((current_time - last_update) > pdMS_TO_TICKS(333)) {
             // Show timestamp or other periodic info
             last_update = current_time;
         }
@@ -274,67 +292,77 @@ static esp_err_t ssd1306_display_init(void)
 
 static void display_refresh_main_screen(void)
 {
-    // Only refresh if we have encoder data (prevents premature updates)
-    if (!encoder_data_available) {
-        return;
-    }
-    
     char position_text[32];
     char delta_text[32];
     char button_text[16];
     char container_text[20];
     char dosage_text[20];
     
-    // Update encoder position
-    snprintf(position_text, sizeof(position_text), "Pos: %-8ld", latest_encoder_position);
+    // Update encoder position (use actual value or 0 if no data yet)
+    snprintf(position_text, sizeof(position_text), "Pos: %-8ld", 
+             encoder_data_available ? latest_encoder_position : 0);
     ssd1306_display_text(&ssd1306_dev, 2, position_text, strlen(position_text), false);
     
-    // Update encoder delta
-    if (latest_encoder_delta == -999) {
+    // Update encoder delta (use actual value or 0 if no data yet)
+    if (encoder_data_available && latest_encoder_delta == -999) {
         // Special case for reset operation
         snprintf(delta_text, sizeof(delta_text), "Delta: 0     ");
     } else {
+        int32_t delta_value = encoder_data_available ? latest_encoder_delta : 0;
         snprintf(delta_text, sizeof(delta_text), "Delta: %s%-6ld", 
-                 latest_encoder_delta > 0 ? "+" : "", latest_encoder_delta);
+                 delta_value > 0 ? "+" : "", delta_value);
     }
     ssd1306_display_text(&ssd1306_dev, 4, delta_text, strlen(delta_text), false);
     
-    // Update button state
-    if (latest_button_pressed && latest_encoder_delta == -999) {
+    // Update button state (use actual value or default to "---")
+    if (encoder_data_available && latest_button_pressed && latest_encoder_delta == -999) {
         snprintf(button_text, sizeof(button_text), "Btn: RESET!");
     } else {
         snprintf(button_text, sizeof(button_text), "Btn: %-6s", 
-                 latest_button_pressed ? "PRESS" : "---");
+                 (encoder_data_available && latest_button_pressed) ? "PRESS" : "---");
     }
     ssd1306_display_text(&ssd1306_dev, 5, button_text, strlen(button_text), false);
     
-    // Update weight measurements
-    if (weight_data_available) {
-        // Container weight (Channel A)
-        if (latest_container_weight == -999.0f) {
-            snprintf(container_text, sizeof(container_text), "Cont: NO CONN");
-        } else {
-            snprintf(container_text, sizeof(container_text), "Cont: %6dg", (int)round(latest_container_weight));
-        }
-        
-        // Dosage weight (Channel B)
-        if (latest_dosage_weight == -999.0f) {
-            snprintf(dosage_text, sizeof(dosage_text), "Dose: ------");
-        } else {
-            snprintf(dosage_text, sizeof(dosage_text), "Dose: %6dg", (int)round(latest_dosage_weight));
-        }
+    // Update weight measurements with new error code handling
+    // Container weight (Channel A)
+    if (latest_container_weight == WEIGHT_DISPLAY_NO_CONN) {
+        snprintf(container_text, sizeof(container_text), "Cont: NO CONN");
+    } else if (latest_container_weight == WEIGHT_DISPLAY_TARING) {
+        snprintf(container_text, sizeof(container_text), "Cont:  ----g ");
+    } else if (latest_container_weight < 0) {
+        // Any other negative value is an unknown error
+        snprintf(container_text, sizeof(container_text), "Cont: ERROR  ");
+    } else if (!weight_data_available) {
+        // No weight data received yet - show actual value or 0
+        snprintf(container_text, sizeof(container_text), "Cont: %6dg", 0);
     } else {
-        // No weight data available yet
-        snprintf(container_text, sizeof(container_text), "Cont: -----g");
-        snprintf(dosage_text, sizeof(dosage_text), "Dose: -----g");
+        // Normal weight display
+        snprintf(container_text, sizeof(container_text), "Cont: %6dg", (int)round(latest_container_weight));
+    }
+    
+    // Dosage weight (Channel B)
+    if (latest_dosage_weight == WEIGHT_DISPLAY_NO_CONN) {
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: NO CONN");
+    } else if (latest_dosage_weight == WEIGHT_DISPLAY_TARING) {
+        snprintf(dosage_text, sizeof(dosage_text), "Dose:  ----g ");
+    } else if (latest_dosage_weight < 0) {
+        // Any other negative value is an unknown error
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: ERROR  ");
+    } else if (!weight_data_available) {
+        // No weight data received yet - show "------" for disabled channel
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: ------");
+    } else {
+        // Normal weight display
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: %6dg", (int)round(latest_dosage_weight));
     }
     
     ssd1306_display_text(&ssd1306_dev, 6, container_text, strlen(container_text), false);
     ssd1306_display_text(&ssd1306_dev, 7, dosage_text, strlen(dosage_text), false);
     
     ESP_LOGD(TAG_DISPLAY, "Screen refreshed - Pos: %ld, Delta: %ld, Btn: %s, Cont: %.1fg, Dose: %.1fg",
-             latest_encoder_position, latest_encoder_delta, 
-             latest_button_pressed ? "PRESS" : "---",
+             encoder_data_available ? latest_encoder_position : 0, 
+             encoder_data_available ? latest_encoder_delta : 0, 
+             (encoder_data_available && latest_button_pressed) ? "PRESS" : "---",
              latest_container_weight, latest_dosage_weight);
 }
 
