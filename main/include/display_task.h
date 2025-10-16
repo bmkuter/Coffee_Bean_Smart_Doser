@@ -56,6 +56,7 @@ typedef struct {
         struct {
             char status_text[32];
             bool is_error;
+            uint32_t duration_ms;  // Duration to show message (0 = permanent until cleared)
         } system_status;
         
         struct {
@@ -97,9 +98,10 @@ esp_err_t display_send_encoder_data(int32_t position, int32_t delta, bool button
  * @brief Send system status message to display
  * @param status_text Status message text
  * @param is_error True if this is an error message
+ * @param duration_ms Duration to show message in milliseconds (0 = permanent until cleared)
  * @return ESP_OK on success, ESP_ERR_NO_MEM if queue full
  */
-esp_err_t display_send_system_status(const char* status_text, bool is_error);
+esp_err_t display_send_system_status(const char* status_text, bool is_error, uint32_t duration_ms);
 
 /**
  * @brief Send coffee dosing information to display

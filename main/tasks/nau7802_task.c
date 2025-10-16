@@ -10,6 +10,7 @@
 #include "shared_i2c_bus.h"
 #include "coffee_doser_config.h"
 #include "rotary_encoder_task.h"
+#include "motor_control_task.h"
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,7 +75,7 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
 static esp_err_t nau7802_save_tare_values(void);
 static esp_err_t nau7802_load_tare_values(void);
 static esp_err_t nau7802_init_nvs(void);
-static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms);
+static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms, const char* channel_name);
 
 
 esp_err_t nau7802_task_init(void)
@@ -200,17 +201,6 @@ static void nau7802_task_function(void* pvParameters)
     uint32_t error_count = 0;
     uint32_t last_error_log = 0;
 
-    // Calibrate optimal timeout on startup
-    // uint32_t calibrated_timeout = 100;  // Default fallback
-    // esp_err_t cal_ret = nau7802_test_timeout_values(20, 200, 10, &calibrated_timeout);
-    // if (cal_ret == ESP_OK) {
-    //     optimal_timeout_ms = calibrated_timeout;
-    //     timeout_calibrated = true;
-    //     ESP_LOGI(TAG_NAU7802, "Using calibrated timeout: %lu ms", optimal_timeout_ms);
-    // } else {
-    //     ESP_LOGW(TAG_NAU7802, "Timeout calibration failed, using default: %lu ms", optimal_timeout_ms);
-    // }
-
     while (nau7802_task_running) {
         esp_err_t ret;
         bool channel_a_success = false;
@@ -229,7 +219,7 @@ static void nau7802_task_function(void* pvParameters)
                         uint32_t timestamp_ms = esp_timer_get_time() / 1000;
                         
                         nau7802_data.channel_a.raw_value = raw_value;
-                        nau7802_data.channel_a.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_a_cal, &nau7802_data.channel_a, timestamp_ms);
+                        nau7802_data.channel_a.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_a_cal, &nau7802_data.channel_a, timestamp_ms, "Channel A");
                         nau7802_data.channel_a.data_ready = true;
                         nau7802_data.channel_a.timestamp = timestamp_ms;
                         nau7802_data.channel_a.sample_count = ++channel_a_samples;
@@ -296,6 +286,11 @@ static void nau7802_task_function(void* pvParameters)
         // Small delay between channel reads (important for strain gauge settling)
         vTaskDelay(pdMS_TO_TICKS(10));  // Increased for better strain gauge stability
 
+        // Channel B (Dosage Cup Weight) - DISABLED
+        // Force Channel B to always show as disconnected
+        channel_b_connected = false;
+        
+        /* DISABLED - Channel B reading code
         // Read Channel B (Dosage Cup Weight)
         ret = nau7802_select_channel(NAU7802_CHANNEL_2);
         if (ret == ESP_OK) {
@@ -309,7 +304,7 @@ static void nau7802_task_function(void* pvParameters)
                         uint32_t timestamp_ms = esp_timer_get_time() / 1000;
                         
                         nau7802_data.channel_b.raw_value = raw_value;
-                        nau7802_data.channel_b.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_b_cal, &nau7802_data.channel_b, timestamp_ms);
+                        nau7802_data.channel_b.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_b_cal, &nau7802_data.channel_b, timestamp_ms, "Channel B");
                         nau7802_data.channel_b.data_ready = true;
                         nau7802_data.channel_b.timestamp = timestamp_ms;
                         nau7802_data.channel_b.sample_count = ++channel_b_samples;
@@ -355,6 +350,7 @@ static void nau7802_task_function(void* pvParameters)
             channel_b_connected = false;
             ESP_LOGW(TAG_NAU7802, "Channel B strain gauge appears disconnected (errors: %lu)", channel_b_consecutive_errors);
         }
+        */
 
         // Error counting and periodic logging for overall status
         if (!channel_a_connected && !channel_b_connected) {
@@ -717,13 +713,28 @@ static esp_err_t nau7802_perform_calibration(void)
     return ESP_ERR_TIMEOUT;
 }
 
-// Rotary encoder event handler for tare functionality
+// Rotary encoder event handler for tare functionality and motor control
 static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position, int32_t delta)
 {
     (void)position;  // Unused parameter
     (void)delta;     // Unused parameter
     
-    if (event == ROTARY_EVENT_LONG_PRESS) {
+    if (event == ROTARY_EVENT_DOUBLE_CLICK) {
+        ESP_LOGI(TAG_NAU7802, "Double-click detected - sending dispense command to motor task");
+        
+        // Show "DISPENSING" notification on display for 2 seconds
+        display_send_system_status("  DISPENSING", false, 2000);
+        
+        // Send dispense command to motor control task
+        // Parameter could be target weight from encoder position or a fixed amount
+        uint32_t target_grams = 20;  // Example: dispense 20 grams
+        esp_err_t ret = motor_send_command(MOTOR_CMD_DISPENSE, target_grams);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG_NAU7802, "Dispense command sent to motor task (target: %lu grams)", target_grams);
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to send dispense command: %s", esp_err_to_name(ret));
+        }
+    } else if (event == ROTARY_EVENT_LONG_PRESS) {
         ESP_LOGI(TAG_NAU7802, "Rotary encoder long press detected - taring scale...");
         
         bool any_tared = false;
@@ -764,12 +775,12 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
             // No need for manual display update here - the main loop will handle it
         } else if (!channel_a_connected && !channel_b_connected) {
             ESP_LOGW(TAG_NAU7802, "No strain gauges connected - cannot tare scale");
-            // Send error message to display
-            display_send_system_status("NO SCALE", true);
+            // Send error message to display (3 seconds)
+            display_send_system_status("NO SCALE", true, 3000);
         } else {
             ESP_LOGW(TAG_NAU7802, "Failed to tare any connected channels");
-            // Send error message to display
-            display_send_system_status("TARE FAILED", true);
+            // Send error message to display (3 seconds)
+            display_send_system_status("TARE FAILED", true, 3000);
         }
     }
 }
@@ -916,8 +927,8 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
     // Set flag to prevent display updates during tare
     tare_in_progress = true;
     
-    // Show "Scale Taring..." message on display
-    display_send_system_status("Scale Taring...", false);
+    // Show "Scale Taring..." message on display (permanent until cleared)
+    display_send_system_status("Scale Taring...", false, 0);
     
     // Force display to show "----" during tare by sending taring indicator
     display_send_coffee_info(WEIGHT_DISPLAY_TARING, WEIGHT_DISPLAY_TARING, false);
@@ -1000,8 +1011,9 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
             ESP_LOGW(TAG_NAU7802, "Failed to save tare values to flash: %s", esp_err_to_name(save_ret));
         }
         
-        // Show "Scale Tared!" success message
-        display_send_system_status("Scale Tared!", false);
+        // Show "Scale Tared!" success message for 2 seconds
+        // This will replace the infinite "Scale Taring..." message immediately
+        display_send_system_status("Scale Tared!", false, 2000);
         
         // Clear tare-in-progress flag to resume normal display updates
         tare_in_progress = false;
@@ -1012,8 +1024,9 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
     // Clear tare-in-progress flag on error too
     tare_in_progress = false;
     
-    // Show error message if tare failed
-    display_send_system_status("Tare Failed!", true);
+    // Show error message if tare failed (3 seconds)
+    // This will replace the infinite "Scale Taring..." message immediately
+    display_send_system_status("Tare Failed!", true, 3000);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -1261,7 +1274,7 @@ esp_err_t nau7802_kalman_set_parameters(kalman_filter_t* kf, float process_noise
 }
 
 // Enhanced weight conversion with Kalman filtering
-static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms)
+static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms, const char* channel_name)
 {
     // Basic weight conversion
     float raw_weight = (float)(raw_value - cal->zero_offset) / cal->scale_factor;
@@ -1290,12 +1303,12 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         raw_weight = sum / 10.0f;  // Use 10-sample moving average for balanced performance
     }
     
-    // Debug logging for calibration (remove once calibrated)
-    static uint32_t debug_counter = 0;
-    if (++debug_counter % 20 == 0) {  // Log every 20 samples (once per second)
-        ESP_LOGI(TAG_NAU7802, "Calibration debug: raw=%ld, offset=%ld, scale=%.1f, raw_weight=%.2fg", 
-                 raw_value, cal->zero_offset, cal->scale_factor, raw_weight);
-    }
+    // // Debug logging for calibration (remove once calibrated)
+    // static uint32_t debug_counter = 0;
+    // if (++debug_counter % 20 == 0) {  // Log every 20 samples (once per second)
+    //     ESP_LOGI(TAG_NAU7802, "%s calibration debug: raw=%ld, offset=%ld, scale=%.1f, raw_weight=%.2fg", 
+    //              channel_name, raw_value, cal->zero_offset, cal->scale_factor, raw_weight);
+    // }
 
     // Initialize Kalman filter if not done yet
     if (!ch_data->kf.initialized) {

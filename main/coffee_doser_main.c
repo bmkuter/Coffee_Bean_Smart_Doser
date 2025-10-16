@@ -23,6 +23,7 @@
 #include "rotary_encoder_task.h"
 #include "display_task.h"
 #include "nau7802_task.h"
+#include "motor_control_task.h"
 
 static void initialize_system(void)
 {
@@ -82,6 +83,13 @@ static void initialize_peripherals(void)
         return;
     }
     
+    // Initialize motor control task
+    ret = motor_control_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "Failed to initialize motor control task: %s", esp_err_to_name(ret));
+        return;
+    }
+    
     ESP_LOGI(TAG_MAIN, "Peripheral initialization complete");
     ESP_LOGI(TAG_MAIN, "Direct I2C hardware access with rotary encoder, display, and NAU7802 ADC tasks running");
 }
@@ -96,6 +104,10 @@ static void log_system_info(void)
     ESP_LOGI(TAG_MAIN, "    * Channel B: Dosage cup weight monitoring");
     ESP_LOGI(TAG_MAIN, "  - Seesaw Rotary Encoder (0x%02X)", ROTARY_ENCODER_ADDR);
     ESP_LOGI(TAG_MAIN, "  - SSD1306 OLED Display (0x%02X)", OLED_DISPLAY_ADDR);
+    ESP_LOGI(TAG_MAIN, "Motor control peripherals (Phase 2):");
+    ESP_LOGI(TAG_MAIN, "  - PCA9685 PWM Motor Controller (0x60)");
+    ESP_LOGI(TAG_MAIN, "    * Stepper motor on M1+M2 (Ports 1)");
+    ESP_LOGI(TAG_MAIN, "    * Air pump on M3 (Port 3)");
     ESP_LOGI(TAG_MAIN, "===============================");
 }
 

@@ -33,10 +33,26 @@ static bool display_task_running = false;
 static uint32_t messages_processed = 0;
 static uint32_t queue_overflows = 0;
 
-// Status message overlay variables
+// Status notification queue (circular buffer)
+// Each notification has text, error flag, and duration:
+//   - duration_ms = 0: Stay until replaced by next message (infinite)
+//   - duration_ms > 0: Auto-clear after duration expires
+#define STATUS_NOTIFICATION_QUEUE_SIZE 5
+typedef struct {
+    char text[64];
+    bool is_error;
+    uint32_t duration_ms;  // 0 = stay until replaced, >0 = auto-clear after duration
+} status_notification_t;
+
+static status_notification_t notification_queue[STATUS_NOTIFICATION_QUEUE_SIZE];
+static uint8_t notification_queue_head = 0;
+static uint8_t notification_queue_tail = 0;
+static uint8_t notification_queue_count = 0;
+
+// Current displayed notification tracking
 static bool status_message_active = false;
 static TickType_t status_message_start_time = 0;
-static const TickType_t STATUS_MESSAGE_TIMEOUT = pdMS_TO_TICKS(3000);  // 3 seconds
+static uint32_t current_message_duration_ms = 0;  // 0 = infinite, stays until replaced
 
 // Latest data for display (all display state in one place)
 static int32_t latest_encoder_position = 0;
@@ -193,12 +209,34 @@ static void display_task_function(void* pvParameters)
             }
         }
         
-        // Check for status message timeout
-        if (status_message_active) {
+        // Check if current message duration has expired (only for finite duration messages)
+        if (status_message_active && current_message_duration_ms > 0) {
             TickType_t current_time = xTaskGetTickCount();
-            if ((current_time - status_message_start_time) >= STATUS_MESSAGE_TIMEOUT) {
-                display_clear_status_overlay();
-                status_message_active = false;
+            TickType_t elapsed_time = (current_time - status_message_start_time) * portTICK_PERIOD_MS;
+            
+            if (elapsed_time >= current_message_duration_ms) {
+                // Message duration expired
+                ESP_LOGI(TAG_DISPLAY, "Status message expired after %lums", current_message_duration_ms);
+                
+                // Check if there are queued notifications to display
+                if (notification_queue_count > 0) {
+                    // Display next queued message
+                    status_notification_t next = notification_queue[notification_queue_head];
+                    notification_queue_head = (notification_queue_head + 1) % STATUS_NOTIFICATION_QUEUE_SIZE;
+                    notification_queue_count--;
+                    
+                    display_draw_status_overlay(next.text);
+                    status_message_start_time = xTaskGetTickCount();
+                    current_message_duration_ms = next.duration_ms;
+                    
+                    ESP_LOGI(TAG_DISPLAY, "Displaying queued: '%s' (duration: %lums, queue: %d/%d)", 
+                             next.text, next.duration_ms, notification_queue_count, STATUS_NOTIFICATION_QUEUE_SIZE);
+                } else {
+                    // No more messages, clear the banner
+                    display_clear_status_overlay();
+                    status_message_active = false;
+                    ESP_LOGI(TAG_DISPLAY, "Cleared banner, no more messages");
+                }
             }
         }
         
@@ -228,20 +266,82 @@ static void display_process_encoder_message(const display_message_t* msg)
 
 static void display_process_status_message(const display_message_t* msg)
 {
-    // Show status message in overlay above header lines
-    display_draw_status_overlay(msg->data.system_status.status_text);
-    status_message_active = true;
-    status_message_start_time = xTaskGetTickCount();
+    // Create notification from incoming message
+    status_notification_t notif = {
+        .is_error = msg->data.system_status.is_error,
+        .duration_ms = msg->data.system_status.duration_ms
+    };
+    strncpy(notif.text, msg->data.system_status.status_text, sizeof(notif.text) - 1);
+    notif.text[sizeof(notif.text) - 1] = '\0';
+    
+    // Check current message duration:
+    // - If current message has duration_ms = 0 (infinite), replace it immediately
+    // - If current message has duration_ms > 0 (finite), queue the new message
+    
+    if (!status_message_active) {
+        // No message currently showing, display this one immediately
+        display_draw_status_overlay(notif.text);
+        status_message_active = true;
+        status_message_start_time = xTaskGetTickCount();
+        current_message_duration_ms = notif.duration_ms;
+        ESP_LOGI(TAG_DISPLAY, "Displaying: '%s' (duration: %lums)", 
+                 notif.text, notif.duration_ms);
+    }
+    else if (current_message_duration_ms == 0) {
+        // Current message is infinite (duration = 0)
+        if (notification_queue_count == 0) {
+            // No queue, replace current message immediately
+            display_draw_status_overlay(notif.text);
+            status_message_start_time = xTaskGetTickCount();
+            current_message_duration_ms = notif.duration_ms;
+            ESP_LOGI(TAG_DISPLAY, "Replaced infinite message with: '%s' (duration: %lums)", 
+                     notif.text, notif.duration_ms);
+        } else {
+            // Queue exists, add new message to end and display next queued message
+            if (notification_queue_count < STATUS_NOTIFICATION_QUEUE_SIZE) {
+                notification_queue[notification_queue_tail] = notif;
+                notification_queue_tail = (notification_queue_tail + 1) % STATUS_NOTIFICATION_QUEUE_SIZE;
+                notification_queue_count++;
+                ESP_LOGI(TAG_DISPLAY, "Queued new message, displaying next from queue");
+            } else {
+                ESP_LOGW(TAG_DISPLAY, "Queue full, dropping: '%s'", notif.text);
+            }
+            
+            // Display next message from queue
+            status_notification_t next = notification_queue[notification_queue_head];
+            notification_queue_head = (notification_queue_head + 1) % STATUS_NOTIFICATION_QUEUE_SIZE;
+            notification_queue_count--;
+            
+            display_draw_status_overlay(next.text);
+            status_message_start_time = xTaskGetTickCount();
+            current_message_duration_ms = next.duration_ms;
+            ESP_LOGI(TAG_DISPLAY, "Displaying queued: '%s' (duration: %lums, queue: %d/%d)", 
+                     next.text, next.duration_ms, notification_queue_count, STATUS_NOTIFICATION_QUEUE_SIZE);
+        }
+    }
+    else {
+        // Current message has finite duration, queue the new message
+        if (notification_queue_count < STATUS_NOTIFICATION_QUEUE_SIZE) {
+            notification_queue[notification_queue_tail] = notif;
+            notification_queue_tail = (notification_queue_tail + 1) % STATUS_NOTIFICATION_QUEUE_SIZE;
+            notification_queue_count++;
+            ESP_LOGI(TAG_DISPLAY, "Queued notification: '%s' (queue: %d/%d)", 
+                     notif.text, notification_queue_count, STATUS_NOTIFICATION_QUEUE_SIZE);
+        } else {
+            ESP_LOGW(TAG_DISPLAY, "Notification queue full, dropping: '%s'", notif.text);
+        }
+    }
 }
 
 static void display_process_coffee_message(const display_message_t* msg)
 {
     // Store the latest weight data for display on encoder screen
-    latest_container_weight = msg->data.coffee_info.current_weight;
-    latest_dosage_weight = msg->data.coffee_info.target_weight;
+    // Note: Parameter naming is legacy - "target_weight" = dosage cup, "current_weight" = container
+    latest_dosage_weight = msg->data.coffee_info.target_weight;      // Channel B (dosage cup)
+    latest_container_weight = msg->data.coffee_info.current_weight;  // Channel A (container)
     weight_data_available = true;
     
-    ESP_LOGD(TAG_DISPLAY, "Coffee Info - Target: %.1fg, Current: %.1fg, Dosing: %s",
+    ESP_LOGD(TAG_DISPLAY, "Coffee Info - Dosage: %.1fg, Container: %.1fg, Dosing: %s",
              msg->data.coffee_info.target_weight,
              msg->data.coffee_info.current_weight,
              msg->data.coffee_info.dosing_active ? "YES" : "NO");
@@ -438,7 +538,7 @@ esp_err_t display_send_encoder_data(int32_t position, int32_t delta, bool button
     return ESP_OK;
 }
 
-esp_err_t display_send_system_status(const char* status_text, bool is_error)
+esp_err_t display_send_system_status(const char* status_text, bool is_error, uint32_t duration_ms)
 {
     display_message_t msg = {
         .type = DISPLAY_MSG_SYSTEM_STATUS,
@@ -448,6 +548,7 @@ esp_err_t display_send_system_status(const char* status_text, bool is_error)
     strncpy(msg.data.system_status.status_text, status_text, sizeof(msg.data.system_status.status_text) - 1);
     msg.data.system_status.status_text[sizeof(msg.data.system_status.status_text) - 1] = '\0';
     msg.data.system_status.is_error = is_error;
+    msg.data.system_status.duration_ms = duration_ms;
     
     if (xQueueSend(display_message_queue, &msg, 0) != pdTRUE) {
         queue_overflows++;

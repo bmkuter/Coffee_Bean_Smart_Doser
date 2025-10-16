@@ -205,6 +205,11 @@ static void rotary_encoder_task(void* pvParameters)
     bool long_press_triggered = false;
     bool showing_long_press_feedback = false;
     
+    // Double-click detection
+    TickType_t first_click_time = 0;
+    const TickType_t double_click_window = pdMS_TO_TICKS(400);  // 400ms window for double-click
+    bool waiting_for_second_click = false;
+    
     // Rate limiting for display updates
     TickType_t last_display_update = 0;
     const TickType_t display_update_interval = pdMS_TO_TICKS(100);  // Max 10Hz display updates (was 50ms/20Hz)
@@ -255,6 +260,11 @@ static void rotary_encoder_task(void* pvParameters)
         if (ret == ESP_OK) {
             TickType_t current_time = xTaskGetTickCount();
             
+            // Check if double-click window has expired
+            if (waiting_for_second_click && (current_time - first_click_time) >= double_click_window) {
+                waiting_for_second_click = false;  // Window expired, reset
+            }
+            
             // Check if raw button state has changed
             if (raw_button_pressed != last_raw_button_state) {
                 // Raw state changed, record the time and update raw state
@@ -292,6 +302,26 @@ static void rotary_encoder_task(void* pvParameters)
                         rotary_data.last_event = event;
 
                         xSemaphoreGive(rotary_data_mutex);
+
+                        // Double-click detection on button release
+                        if (!raw_button_pressed) {  // Button was just released
+                            if (waiting_for_second_click && (current_time - first_click_time) < double_click_window) {
+                                // Second click detected within window - this is a double-click!
+                                ESP_LOGI(TAG_ROTARY, "Double-click detected!");
+                                waiting_for_second_click = false;
+                                
+                                // Update event to double-click
+                                event = ROTARY_EVENT_DOUBLE_CLICK;
+                                if (xSemaphoreTake(rotary_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                    rotary_data.last_event = event;
+                                    xSemaphoreGive(rotary_data_mutex);
+                                }
+                            } else {
+                                // First click - start waiting for second click
+                                first_click_time = current_time;
+                                waiting_for_second_click = true;
+                            }
+                        }
 
                         // Call callback if registered
                         if (event_callback != NULL) {
