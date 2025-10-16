@@ -24,9 +24,9 @@ extern "C" {
 
 // Display Task Configuration
 #define DISPLAY_TASK_STACK_SIZE     4096
-#define DISPLAY_TASK_PRIORITY       2        // Lower than encoder for responsiveness
+#define DISPLAY_TASK_PRIORITY       4        // Higher priority to handle queue better (was 2)
 #define DISPLAY_UPDATE_RATE_MS      100      // 10 FPS update rate
-#define DISPLAY_MESSAGE_QUEUE_SIZE  10       // Buffer for display updates
+#define DISPLAY_MESSAGE_QUEUE_SIZE  64       // Larger buffer for display updates (was 0x20/32)
 
 // Display Message Types
 typedef enum {

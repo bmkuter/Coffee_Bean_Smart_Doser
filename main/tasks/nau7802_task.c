@@ -240,7 +240,7 @@ static void nau7802_task_function(void* pvParameters)
                                      nau7802_data.channel_a.weight_grams);
                             channel_a_consecutive_errors++;
                         } else {
-                            ESP_LOGI(TAG_NAU7802, "Channel A: raw=%ld, filtered=%.0fg, velocity=%.3fg/s, accel=%.3fg/s², conf=%.2f", 
+                            ESP_LOGD(TAG_NAU7802, "Channel A: raw=%ld, filtered=%.0fg, velocity=%.3fg/s, accel=%.3fg/s², conf=%.2f", 
                                      raw_value, nau7802_data.channel_a.filtered_weight,
                                      nau7802_data.channel_a.velocity, nau7802_data.channel_a.acceleration,
                                      nau7802_data.channel_a.confidence);

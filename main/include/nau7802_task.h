@@ -23,7 +23,7 @@ extern "C" {
 
 // Task Configuration
 #define NAU7802_TASK_STACK_SIZE     4096
-#define NAU7802_TASK_PRIORITY       3        // Higher than display, lower than encoder for responsiveness
+#define NAU7802_TASK_PRIORITY       3        // Lower than display for better queue processing
 #define NAU7802_POLL_RATE_MS        20       // 50 Hz polling for 40 SPS ADC (1.25x faster than ADC rate for reliable capture)
 #define NAU7802_SAMPLE_AVERAGE      4        // Number of samples to average for stability
 

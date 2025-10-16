@@ -207,7 +207,7 @@ static void rotary_encoder_task(void* pvParameters)
     
     // Rate limiting for display updates
     TickType_t last_display_update = 0;
-    const TickType_t display_update_interval = pdMS_TO_TICKS(50);  // Max 20Hz display updates
+    const TickType_t display_update_interval = pdMS_TO_TICKS(100);  // Max 10Hz display updates (was 50ms/20Hz)
     bool pending_display_update = false;
     int32_t latest_position = 0;
     int32_t cumulative_delta = 0;
@@ -273,8 +273,9 @@ static void rotary_encoder_task(void* pvParameters)
                     long_press_triggered = false;
                     if (showing_long_press_feedback) {
                         showing_long_press_feedback = false;
-                        // Send display update to clear any long press feedback
-                        display_send_encoder_data(rotary_data.position, 0, false);
+                        // Mark for rate-limited display update to clear long press feedback
+                        latest_position = rotary_data.position;
+                        pending_display_update = true;
                     }
                 }
             } else if (raw_button_pressed != last_button_state) {
@@ -299,14 +300,9 @@ static void rotary_encoder_task(void* pvParameters)
 
                         ESP_LOGI(TAG_ROTARY, "Button: %s (debounced)", raw_button_pressed ? "PRESSED" : "RELEASED");
 
-                        // Send display update for button state change (but not reset yet)
-                        if (!raw_button_pressed) {
-                            // Button released - send current state to display
-                            display_send_encoder_data(rotary_data.position, 0, false);
-                        } else {
-                            // Button pressed - show press state but don't reset yet
-                            display_send_encoder_data(rotary_data.position, 0, true);
-                        }
+                        // Mark for rate-limited display update instead of immediate send
+                        latest_position = rotary_data.position;
+                        pending_display_update = true;
                     }
 
                     last_button_state = raw_button_pressed;
@@ -327,8 +323,9 @@ static void rotary_encoder_task(void* pvParameters)
                         event_callback(ROTARY_EVENT_LONG_PRESS, rotary_data.position, 0);
                     }
                     
-                    // Update display with long press feedback
-                    display_send_encoder_data(rotary_data.position, 0, true);  // Show button pressed
+                    // Mark for rate-limited display update instead of immediate send
+                    latest_position = rotary_data.position;
+                    pending_display_update = true;
                 }
             }
         }
@@ -571,7 +568,23 @@ esp_err_t rotary_encoder_set_position(int32_t position)
     data[2] = (position >> 8) & 0xFF;
     data[3] = position & 0xFF;
 
-    return seesaw_write_register(SEESAW_ENCODER_BASE, SEESAW_ENCODER_POSITION, data, 4);
+    // Update hardware position
+    esp_err_t ret = seesaw_write_register(SEESAW_ENCODER_BASE, SEESAW_ENCODER_POSITION, data, 4);
+    
+    if (ret == ESP_OK) {
+        // Update internal position state (apply same reversal as in the main loop)
+        if (xSemaphoreTake(rotary_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            rotary_data.position = -position;  // Apply same reversal as main loop
+            xSemaphoreGive(rotary_data_mutex);
+            
+            // Immediately send display update to show new position
+            display_send_encoder_data(rotary_data.position, 0, rotary_data.button_pressed);
+            
+            ESP_LOGI(TAG_ROTARY, "Position reset to %ld, display updated", rotary_data.position);
+        }
+    }
+    
+    return ret;
 }
 
 esp_err_t rotary_encoder_register_callback(rotary_event_callback_t callback)
