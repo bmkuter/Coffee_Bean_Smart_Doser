@@ -38,6 +38,7 @@ typedef enum {
     DISPLAY_MSG_ENCODER_UPDATE,
     DISPLAY_MSG_SYSTEM_STATUS,
     DISPLAY_MSG_COFFEE_INFO,
+    DISPLAY_MSG_INDIVIDUAL_WEIGHT,  // New: single weight from one channel
     DISPLAY_MSG_CLEAR_SCREEN,
     DISPLAY_MSG_SHUTDOWN
 } display_message_type_t;
@@ -60,10 +61,15 @@ typedef struct {
         } system_status;
         
         struct {
-            float target_weight;
-            float current_weight;
+            float container_weight;  // Channel A weight in grams
+            float dosage_weight;     // Channel B weight in grams
             bool dosing_active;
         } coffee_info;
+        
+        struct {
+            float weight;    // Weight value in grams (or error code)
+            int channel;     // Channel identifier (0=container/A, 1=dosage/B, etc.)
+        } individual_weight;
     } data;
 } display_message_t;
 
@@ -104,13 +110,21 @@ esp_err_t display_send_encoder_data(int32_t position, int32_t delta, bool button
 esp_err_t display_send_system_status(const char* status_text, bool is_error, uint32_t duration_ms);
 
 /**
- * @brief Send coffee dosing information to display
- * @param target_weight Target weight in grams
- * @param current_weight Current weight in grams
+ * @brief Send weight measurements to display (legacy - kept for compatibility)
+ * @param container_weight Container weight in grams (Channel A)
+ * @param dosage_weight Dosage cup weight in grams (Channel B)
  * @param dosing_active True if dosing is in progress
  * @return ESP_OK on success, ESP_ERR_NO_MEM if queue full
  */
-esp_err_t display_send_coffee_info(float target_weight, float current_weight, bool dosing_active);
+esp_err_t display_send_coffee_info(float container_weight, float dosage_weight, bool dosing_active);
+
+/**
+ * @brief Send individual weight measurement from a single channel (scalable architecture)
+ * @param weight Weight value in grams (or error code like WEIGHT_DISPLAY_NO_CONN)
+ * @param channel Channel identifier (0=container/Channel A, 1=dosage/Channel B, etc.)
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if queue full
+ */
+esp_err_t display_send_individual_weight(float weight, int channel);
 
 /**
  * @brief Clear the display screen

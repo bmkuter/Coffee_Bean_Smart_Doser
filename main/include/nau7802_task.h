@@ -25,7 +25,7 @@ extern "C" {
 #define NAU7802_TASK_STACK_SIZE     4096
 #define NAU7802_TASK_PRIORITY       3        // Lower than display for better queue processing
 #define NAU7802_POLL_RATE_MS        20       // 50 Hz polling for 40 SPS ADC (1.25x faster than ADC rate for reliable capture)
-#define NAU7802_SAMPLE_AVERAGE      4        // Number of samples to average for stability
+#define NAU7802_SAMPLE_AVERAGE      3        // Number of samples to average for stability
 
 // NAU7802 Register Definitions (from datasheet)
 #define NAU7802_REG_PU_CTRL         0x00    // Power control
@@ -87,7 +87,8 @@ typedef enum {
     NAU7802_RATE_10SPS = 0,     // 10 samples per second
     NAU7802_RATE_20SPS = 1,     // 20 samples per second
     NAU7802_RATE_40SPS = 2,     // 40 samples per second
-    NAU7802_RATE_80SPS = 3      // 80 samples per second
+    NAU7802_RATE_80SPS = 3,     // 80 samples per second
+    NAU7802_RATE_320SPS = 7     // 320 samples per second (for fast buffer flushing)
 } nau7802_rate_t;
 
 // Channel Selection
@@ -124,7 +125,7 @@ typedef struct {
     float acceleration;         // Weight change acceleration (g/s²)
     float confidence;           // Filter confidence (0-1)
     float last_stable_weight;   // Last stable weight for deadband filtering
-    float avg_buffer[10];       // Balanced moving average buffer (10 samples for good noise reduction with faster response)
+    float avg_buffer[NAU7802_SAMPLE_AVERAGE];  // Fast moving average buffer (3 samples = 75ms lag at 40 SPS)
     int avg_index;              // Current index in average buffer
     bool avg_filled;            // Whether average buffer is full
     bool data_ready;            // New data available flag

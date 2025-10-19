@@ -75,6 +75,7 @@ static esp_err_t ssd1306_display_init(void);
 static void display_process_encoder_message(const display_message_t* msg);
 static void display_process_status_message(const display_message_t* msg);
 static void display_process_coffee_message(const display_message_t* msg);
+static void display_process_individual_weight_message(const display_message_t* msg);
 static void display_draw_status_overlay(const char* message);
 static void display_clear_status_overlay(void);
 static void display_redraw_header_lines(void);
@@ -190,6 +191,10 @@ static void display_task_function(void* pvParameters)
                     
                 case DISPLAY_MSG_COFFEE_INFO:
                     display_process_coffee_message(&message);
+                    break;
+                    
+                case DISPLAY_MSG_INDIVIDUAL_WEIGHT:
+                    display_process_individual_weight_message(&message);
                     break;
                     
                 case DISPLAY_MSG_CLEAR_SCREEN:
@@ -336,17 +341,44 @@ static void display_process_status_message(const display_message_t* msg)
 static void display_process_coffee_message(const display_message_t* msg)
 {
     // Store the latest weight data for display on encoder screen
-    // Note: Parameter naming is legacy - "target_weight" = dosage cup, "current_weight" = container
-    latest_dosage_weight = msg->data.coffee_info.target_weight;      // Channel B (dosage cup)
-    latest_container_weight = msg->data.coffee_info.current_weight;  // Channel A (container)
+    latest_container_weight = msg->data.coffee_info.container_weight;  // Channel A (container)
+    latest_dosage_weight = msg->data.coffee_info.dosage_weight;        // Channel B (dosage cup)
     weight_data_available = true;
     
-    ESP_LOGD(TAG_DISPLAY, "Coffee Info - Dosage: %.1fg, Container: %.1fg, Dosing: %s",
-             msg->data.coffee_info.target_weight,
-             msg->data.coffee_info.current_weight,
+    ESP_LOGD(TAG_DISPLAY, "Coffee Info - Container: %.1fg, Dosage: %.1fg, Dosing: %s",
+             msg->data.coffee_info.container_weight,
+             msg->data.coffee_info.dosage_weight,
              msg->data.coffee_info.dosing_active ? "YES" : "NO");
 
     // Refresh the entire main screen to show updated weights
+    display_refresh_main_screen();
+}
+
+static void display_process_individual_weight_message(const display_message_t* msg)
+{
+    // Update the specific channel's weight value
+    switch (msg->data.individual_weight.channel) {
+        case 0:  // Channel A - Container
+            latest_container_weight = msg->data.individual_weight.weight;
+            weight_data_available = true;
+            ESP_LOGD(TAG_DISPLAY, "Channel %d (Container): %.1fg", 
+                     msg->data.individual_weight.channel, msg->data.individual_weight.weight);
+            break;
+            
+        case 1:  // Channel B - Dosage cup
+            latest_dosage_weight = msg->data.individual_weight.weight;
+            weight_data_available = true;
+            ESP_LOGD(TAG_DISPLAY, "Channel %d (Dosage): %.1fg", 
+                     msg->data.individual_weight.channel, msg->data.individual_weight.weight);
+            break;
+            
+        default:
+            ESP_LOGE(TAG_DISPLAY, "Unknown channel %d with weight %.1fg", 
+                     msg->data.individual_weight.channel, msg->data.individual_weight.weight);
+            return;
+    }
+    
+    // Refresh the main screen to show the updated weight
     display_refresh_main_screen();
 }
 
@@ -434,10 +466,10 @@ static void display_refresh_main_screen(void)
         snprintf(container_text, sizeof(container_text), "Cont: ERROR  ");
     } else if (!weight_data_available) {
         // No weight data received yet - show actual value or 0
-        snprintf(container_text, sizeof(container_text), "Cont: %6dg", 0);
+        snprintf(container_text, sizeof(container_text), "Cont:%6.1fg", 0.0f);
     } else {
-        // Normal weight display
-        snprintf(container_text, sizeof(container_text), "Cont: %6dg", (int)round(latest_container_weight));
+        // Normal weight display with 0.1g precision
+        snprintf(container_text, sizeof(container_text), "Cont:%6.1fg", latest_container_weight);
     }
     
     // Dosage weight (Channel B)
@@ -452,8 +484,8 @@ static void display_refresh_main_screen(void)
         // No weight data received yet - show "------" for disabled channel
         snprintf(dosage_text, sizeof(dosage_text), "Dose: ------");
     } else {
-        // Normal weight display
-        snprintf(dosage_text, sizeof(dosage_text), "Dose: %6dg", (int)round(latest_dosage_weight));
+        // Normal weight display with 0.1g precision
+        snprintf(dosage_text, sizeof(dosage_text), "Dose:%6.1fg", latest_dosage_weight);
     }
     
     ssd1306_display_text(&ssd1306_dev, 6, container_text, strlen(container_text), false);
@@ -558,15 +590,34 @@ esp_err_t display_send_system_status(const char* status_text, bool is_error, uin
     return ESP_OK;
 }
 
-esp_err_t display_send_coffee_info(float target_weight, float current_weight, bool dosing_active)
+esp_err_t display_send_coffee_info(float container_weight, float dosage_weight, bool dosing_active)
 {
     display_message_t msg = {
         .type = DISPLAY_MSG_COFFEE_INFO,
         .timestamp = esp_timer_get_time() / 1000,
         .data.coffee_info = {
-            .target_weight = target_weight,
-            .current_weight = current_weight,
+            .container_weight = container_weight,
+            .dosage_weight = dosage_weight,
             .dosing_active = dosing_active
+        }
+    };
+    
+    if (xQueueSend(display_message_queue, &msg, 0) != pdTRUE) {
+        queue_overflows++;
+        return ESP_ERR_NO_MEM;
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t display_send_individual_weight(float weight, int channel)
+{
+    display_message_t msg = {
+        .type = DISPLAY_MSG_INDIVIDUAL_WEIGHT,
+        .timestamp = esp_timer_get_time() / 1000,
+        .data.individual_weight = {
+            .weight = weight,
+            .channel = channel
         }
     };
     

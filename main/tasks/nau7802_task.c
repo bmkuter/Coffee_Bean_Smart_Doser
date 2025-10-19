@@ -66,6 +66,7 @@ static esp_err_t nau7802_write_register(uint8_t reg_addr, uint8_t value);
 static esp_err_t nau7802_read_register(uint8_t reg_addr, uint8_t* value);
 static esp_err_t nau7802_read_adc_raw(int32_t* raw_value);
 static esp_err_t nau7802_select_channel(nau7802_channel_t channel);
+static esp_err_t nau7802_flush_channel_buffer(nau7802_channel_t channel);
 static esp_err_t nau7802_wait_for_data_ready(uint32_t timeout_ms);
 static bool nau7802_is_data_ready(void);
 static float nau7802_raw_to_weight(int32_t raw_value, nau7802_calibration_t* cal);
@@ -76,7 +77,6 @@ static esp_err_t nau7802_save_tare_values(void);
 static esp_err_t nau7802_load_tare_values(void);
 static esp_err_t nau7802_init_nvs(void);
 static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms, const char* channel_name);
-
 
 esp_err_t nau7802_task_init(void)
 {
@@ -128,8 +128,9 @@ esp_err_t nau7802_task_init(void)
     nau7802_data.device_ready = true;
 
     // Send initial display update AFTER loading tare values
-    // Channel B disabled (NO_CONN), Channel A will show 0g initially
-    display_send_coffee_info(WEIGHT_DISPLAY_NO_CONN, 0.0f, false);
+    // Both channels will show NO_CONN initially until first measurement
+    display_send_individual_weight(WEIGHT_DISPLAY_NO_CONN, 0);  // Channel A
+    display_send_individual_weight(WEIGHT_DISPLAY_NO_CONN, 1);  // Channel B
     ESP_LOGI(TAG_NAU7802, "Sent initial display update - weights will update once measurements begin");
 
     // Register callback with rotary encoder for tare functionality
@@ -205,11 +206,15 @@ static void nau7802_task_function(void* pvParameters)
         esp_err_t ret;
         bool channel_a_success = false;
         bool channel_b_success = false;
-        
+
         // Read Channel A (Container Weight)
         ret = nau7802_select_channel(NAU7802_CHANNEL_1);
         if (ret == ESP_OK) {
-            ret = nau7802_wait_for_data_ready(250);  // Use calibrated timeout
+            // Flush the buffer to eliminate cross-contamination from Channel B
+            ret = nau7802_flush_channel_buffer(NAU7802_CHANNEL_1);
+        }
+        if (ret == ESP_OK) {
+            ret = nau7802_wait_for_data_ready(50);  // Timeout based on 80 SPS = 12.5ms per sample + margin
             if (ret == ESP_OK) {
                 int32_t raw_value;
                 ret = nau7802_read_adc_raw(&raw_value);
@@ -265,36 +270,22 @@ static void nau7802_task_function(void* pvParameters)
             channel_a_connected = false;
             ESP_LOGW(TAG_NAU7802, "Channel A strain gauge appears disconnected (errors: %lu)", channel_a_consecutive_errors);
         }
-
-        // Send display update with current weight readings (rounded to integers)
-        // Show TARING indicator during tare operation to avoid confusing fluctuations
-        int display_container_weight, display_dosage_weight;
         
-        if (tare_in_progress) {
-            // During tare, show "----" instead of fluctuating values
-            display_container_weight = (int)WEIGHT_DISPLAY_TARING;
-            display_dosage_weight = (int)WEIGHT_DISPLAY_TARING;
-        } else {
-            // Normal operation - show actual weights or NO_CONN if disconnected
-            display_container_weight = channel_a_connected ? (int)round(nau7802_data.channel_a.weight_grams) : (int)WEIGHT_DISPLAY_NO_CONN;
-            display_dosage_weight = channel_b_connected ? (int)round(nau7802_data.channel_b.weight_grams) : (int)WEIGHT_DISPLAY_NO_CONN;
-        }
-        
-        // Send display update to show current weights
-        display_send_coffee_info((float)display_dosage_weight, (float)display_container_weight, false);
+        // Send individual weight update for Channel A (Container)
+        float weight_a = (tare_in_progress) ? WEIGHT_DISPLAY_TARING :
+                         (channel_a_connected) ? nau7802_data.channel_a.weight_grams : WEIGHT_DISPLAY_NO_CONN;
+        // Debug: Print weight with 1 decimal place
+        ESP_LOGD(TAG_NAU7802, "Channel A (Container) weight: %.1fg", weight_a);
+        display_send_individual_weight(weight_a, 0);  // Channel 0 = Container
 
-        // Small delay between channel reads (important for strain gauge settling)
-        vTaskDelay(pdMS_TO_TICKS(10));  // Increased for better strain gauge stability
-
-        // Channel B (Dosage Cup Weight) - DISABLED
-        // Force Channel B to always show as disconnected
-        channel_b_connected = false;
-        
-        /* DISABLED - Channel B reading code
         // Read Channel B (Dosage Cup Weight)
         ret = nau7802_select_channel(NAU7802_CHANNEL_2);
         if (ret == ESP_OK) {
-            ret = nau7802_wait_for_data_ready(250);  // Use same timeout as Channel A
+            // Flush the buffer to eliminate cross-contamination from Channel A
+            ret = nau7802_flush_channel_buffer(NAU7802_CHANNEL_2);
+        }
+        if (ret == ESP_OK) {
+            ret = nau7802_wait_for_data_ready(50);  // Timeout based on 80 SPS = 12.5ms per sample + margin
             if (ret == ESP_OK) {
                 int32_t raw_value;
                 ret = nau7802_read_adc_raw(&raw_value);
@@ -350,7 +341,11 @@ static void nau7802_task_function(void* pvParameters)
             channel_b_connected = false;
             ESP_LOGW(TAG_NAU7802, "Channel B strain gauge appears disconnected (errors: %lu)", channel_b_consecutive_errors);
         }
-        */
+        
+        // Send individual weight update for Channel B (Dosage)
+        float weight_b = (tare_in_progress) ? WEIGHT_DISPLAY_TARING :
+                         (channel_b_connected) ? nau7802_data.channel_b.weight_grams : WEIGHT_DISPLAY_NO_CONN;
+        display_send_individual_weight(weight_b, 1);  // Channel 1 = Dosage
 
         // Error counting and periodic logging for overall status
         if (!channel_a_connected && !channel_b_connected) {
@@ -482,14 +477,12 @@ static esp_err_t nau7802_device_init(void)
         ESP_LOGI(TAG_NAU7802, "CTRL1 register: 0x%02X", ctrl1_readback);
     }
     
-    // Set gain to 4x
     ret = nau7802_set_gain(current_gain);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_NAU7802, "Failed to set gain");
         return ret;
     }
     
-    // Set sample rate to 10 SPS for maximum noise reduction
     ret = nau7802_set_sample_rate(current_rate);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_NAU7802, "Failed to set sample rate");
@@ -593,15 +586,6 @@ static esp_err_t nau7802_read_adc_raw(int32_t* raw_value)
         result |= 0xFF000000;
     }
     
-    // Range validation for disconnected strain gauge detection
-    // NAU7802 with 128x gain should produce readings roughly in range ±2M for connected load cells
-    // Readings near the rails (±8M) or exactly 0x000000/0xFFFFFF often indicate floating inputs
-    if (result == 0x000000 || result == 0xFFFFFF || result == -1 || 
-        result > 6000000 || result < -6000000) {
-        ESP_LOGD(TAG_NAU7802, "ADC reading out of expected range: %ld (possible disconnect)", result);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    
     *raw_value = result;
     return ESP_OK;
 }
@@ -624,6 +608,53 @@ static esp_err_t nau7802_select_channel(nau7802_channel_t channel)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_NAU7802, "Failed to select channel %d with error: %s", channel, esp_err_to_name(ret));
     }
+    return ret;
+}
+
+/**
+ * @brief Flush the ADC buffer after channel switch to eliminate cross-contamination
+ * 
+ * When switching channels, the NAU7802's internal FIFO may contain stale data from
+ * the previous channel. This function:
+ * 1. Switches to 320 SPS for fast flushing
+ * 2. Discards 3-5 samples to clear the buffer
+ * 3. Restores the original sample rate
+ * 
+ * @param channel Channel to flush (after selecting it)
+ * @return ESP_OK on success, error code otherwise
+ */
+static esp_err_t nau7802_flush_channel_buffer(nau7802_channel_t channel)
+{
+    nau7802_rate_t original_rate = current_rate;
+    esp_err_t ret;
+
+    // Switch to 80 SPS for fast buffer flushing
+    ret = nau7802_set_sample_rate(NAU7802_RATE_80SPS);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to set flush rate: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Discard 4 samples to flush the buffer
+    // At 320 SPS, this takes ~12.5ms (4 samples * 3.125ms per sample)
+    for (int i = 0; i < 2; i++) {
+        ret = nau7802_wait_for_data_ready(250);  // 50ms timeout per sample at 80 SPS
+        if (ret == ESP_OK) {
+            int32_t dummy;
+            nau7802_read_adc_raw(&dummy);  // Discard the reading
+        }
+        else {
+            ESP_LOGW(TAG_NAU7802, "Timeout waiting for data ready during flush on channel %d: %s", channel, esp_err_to_name(ret));
+        }
+    }
+    
+    // Restore original sample rate
+    ret = nau7802_set_sample_rate(original_rate);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to restore sample rate: %s", esp_err_to_name(ret));
+    }
+    
+    ESP_LOGD(TAG_NAU7802, "Channel %d buffer flushed", channel);
     return ret;
 }
 
@@ -931,7 +962,8 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
     display_send_system_status("Scale Taring...", false, 0);
     
     // Force display to show "----" during tare by sending taring indicator
-    display_send_coffee_info(WEIGHT_DISPLAY_TARING, WEIGHT_DISPLAY_TARING, false);
+    display_send_individual_weight(WEIGHT_DISPLAY_TARING, 0);  // Channel A
+    display_send_individual_weight(WEIGHT_DISPLAY_TARING, 1);  // Channel B
 
     // Delay for physical stability 
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -983,7 +1015,7 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
         ch_data->kf.initialized = false;  // Force Kalman filter to reinitialize
         
         // Reset moving average buffer 
-        for (int i = 0; i < 20; i++) {  // Updated to match new buffer size
+        for (int i = 0; i < NAU7802_SAMPLE_AVERAGE; i++) {
             ch_data->avg_buffer[i] = 0.0f;  // Reset to zero weight
         }
         ch_data->avg_index = 0;
@@ -1053,16 +1085,20 @@ esp_err_t nau7802_set_sample_rate(nau7802_rate_t rate)
     esp_err_t ret = nau7802_read_register(NAU7802_REG_CTRL2, &ctrl2_val);
     if (ret != ESP_OK) return ret;
     
-    ctrl2_val = (ctrl2_val & ~NAU7802_CTRL2_CRS) | (((uint8_t)rate << 4) & NAU7802_CTRL2_CRS);
+    ctrl2_val = (ctrl2_val & ~0x70) | (((uint8_t)rate << 4) & 0x70);  // Bits 6:4 for CRS
     ret = nau7802_write_register(NAU7802_REG_CTRL2, ctrl2_val);
     
     if (ret == ESP_OK) {
         current_rate = rate;
-        const uint16_t rates[] = {10, 20, 40, 80};
-        ESP_LOGI(TAG_NAU7802, "Sample rate set to %d SPS", rates[rate]);
+        const char* rate_names[] = {"10 SPS", "20 SPS", "40 SPS", "80 SPS", "invalid", "invalid", "invalid", "320 SPS"};
+        ESP_LOGD(TAG_NAU7802, "Sample rate set to %s", rate_names[rate]);
     }
     
-    return ret;
+    // Poll for data ready after changing rate
+    // We use this function to just poll the data ready status to see when sample rate change takes effect
+    ret = nau7802_wait_for_data_ready(1000);  // 1 second
+
+    return ret; 
 }
 
 // Kalman Filter Implementation
@@ -1279,9 +1315,12 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
     // Basic weight conversion
     float raw_weight = (float)(raw_value - cal->zero_offset) / cal->scale_factor;
     
-    // Apply simple deadband filter to reduce noise before Kalman filtering
+    // Apply adaptive deadband filter to reduce noise
+    // Tighter deadband near zero (0.3g), looser for heavier weights (0.5g)
+    float deadband_threshold = (fabsf(ch_data->last_stable_weight) < 1.0f) ? 0.3f : 0.5f;
     float weight_change = fabsf(raw_weight - ch_data->last_stable_weight);
-    if (weight_change < 0.5f) {  // Only ignore changes smaller than 0.5g to maintain gram accuracy
+    
+    if (weight_change < deadband_threshold) {
         raw_weight = ch_data->last_stable_weight;
     } else {
         ch_data->last_stable_weight = raw_weight;
@@ -1289,7 +1328,7 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
     
     // Apply simple moving average for additional smoothing
     ch_data->avg_buffer[ch_data->avg_index] = raw_weight;
-    ch_data->avg_index = (ch_data->avg_index + 1) % 10;
+    ch_data->avg_index = (ch_data->avg_index + 1) % NAU7802_SAMPLE_AVERAGE;
     if (!ch_data->avg_filled && ch_data->avg_index == 0) {
         ch_data->avg_filled = true;
     }
@@ -1297,24 +1336,17 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
     // Calculate moving average if buffer has enough samples
     if (ch_data->avg_filled) {
         float sum = 0.0f;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < NAU7802_SAMPLE_AVERAGE; i++) {
             sum += ch_data->avg_buffer[i];
         }
-        raw_weight = sum / 10.0f;  // Use 10-sample moving average for balanced performance
+        raw_weight = sum / (float)NAU7802_SAMPLE_AVERAGE;  // Fast moving average for quick response
     }
-    
-    // // Debug logging for calibration (remove once calibrated)
-    // static uint32_t debug_counter = 0;
-    // if (++debug_counter % 20 == 0) {  // Log every 20 samples (once per second)
-    //     ESP_LOGI(TAG_NAU7802, "%s calibration debug: raw=%ld, offset=%ld, scale=%.1f, raw_weight=%.2fg", 
-    //              channel_name, raw_value, cal->zero_offset, cal->scale_factor, raw_weight);
-    // }
 
     // Initialize Kalman filter if not done yet
     if (!ch_data->kf.initialized) {
-        // More responsive parameters for faster settling during weight changes
-        float process_noise = 25.0f;       // Higher process noise for faster response
-        float measurement_noise = 2.0f;    // Still trust measurements, but allow more adaptation
+        // Fast response parameters for coffee dosing application
+        float process_noise = 75.0f;       // High process noise for fast tracking of real weight changes
+        float measurement_noise = 1.5f;    // Trust measurements more (lower noise after moving average)
         float dt = 0.025f;                 // 40 SPS = 25ms intervals
         
         nau7802_kalman_init(&ch_data->kf, process_noise, measurement_noise, dt);
@@ -1328,7 +1360,7 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         ch_data->last_stable_weight = raw_weight;  // Initialize deadband filter
         
         // Initialize moving average buffer
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < NAU7802_SAMPLE_AVERAGE; i++) {
             ch_data->avg_buffer[i] = raw_weight;
         }
         ch_data->avg_index = 0;
@@ -1352,13 +1384,25 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         float max_innovation = 5.0f;  // 5g maximum expected innovation for good confidence (tighter with better scale factor)
         ch_data->confidence = fmaxf(0.0f, fminf(1.0f, 1.0f - (innovation / max_innovation)));
         
-        // Ground the scale at 0g - prevent any negative readings and small positive noise
-        float final_weight = fmaxf(0.0f, floorf(ch_data->filtered_weight));
+        // Round to 0.1g precision for display stability
+        float final_weight = roundf(ch_data->filtered_weight * 10.0f) / 10.0f;
         
-        return final_weight;  // Return grounded Kalman-filtered weight
+        // Apply zero-clamp: readings below 0.5g snap to 0g to eliminate warble
+        // This creates a hysteresis zone where the scale must exceed 0.5g before showing non-zero
+        if (final_weight < 0.5f) {
+            final_weight = 0.0f;
+        }
+        
+        return final_weight;  // Return grounded Kalman-filtered weight with 0.1g precision
     } else {
         // Fallback to moving average if Kalman update fails
-        float final_weight = fmaxf(0.0f, floorf(raw_weight));
+        float final_weight = roundf(raw_weight * 10.0f) / 10.0f;
+        
+        // Apply same zero-clamp for consistency
+        if (final_weight < 0.5f) {
+            final_weight = 0.0f;
+        }
+        
         return final_weight;
     }
 }
