@@ -1,7 +1,7 @@
 /*
- * Motor Control Task - PCA9685 PWM Motor Controller Implementation
+ * Motor Control Task - PCA9685 PWM Motor Controller
  * 
- * Controls stepper motor and air pump via Adafruit Motor FeatherWing
+ * Controls DC motors and air pump via Adafruit Motor FeatherWing
  * Uses PCA9685 I2C PWM controller with TB6612 motor drivers
  */
 
@@ -86,10 +86,7 @@ esp_err_t motor_control_task_init(void)
     // Initialize motor state
     if (xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         motor_state.initialized = true;
-        motor_state.stepper_enabled = false;
         motor_state.air_pump_enabled = false;
-        motor_state.stepper_rpm = 60;  // Default 60 RPM
-        motor_state.stepper_position = 0;
         xSemaphoreGive(motor_state_mutex);
     }
 
@@ -128,9 +125,6 @@ esp_err_t motor_control_task_deinit(void)
         vTaskDelete(motor_task_handle);
         motor_task_handle = NULL;
     }
-
-    // Release stepper to save power
-    motor_stepper_release();
 
     // Turn off air pump
     motor_air_pump_control(false);
@@ -181,9 +175,7 @@ static void motor_task_function(void* pvParameters)
             // Log current state
             motor_state_t state;
             if (motor_get_state(&state) == ESP_OK) {
-                ESP_LOGI(TAG_MOTOR, "State: stepper_enabled=%d, air_pump=%d, rpm=%d, pos=%lu",
-                         state.stepper_enabled, state.air_pump_enabled, 
-                         state.stepper_rpm, state.stepper_position);
+                ESP_LOGI(TAG_MOTOR, "State: air_pump=%d", state.air_pump_enabled);
             }
         }
         
@@ -201,62 +193,57 @@ static void motor_process_command(motor_command_t* cmd)
     
     switch (cmd->command) {
         case MOTOR_CMD_DISPENSE:
-            ESP_LOGI(TAG_MOTOR, "DISPENSE command received (from double-click) - parameter=%lu", cmd->parameter);
-            ESP_LOGI(TAG_MOTOR, "Starting PWM sweep test for DC motor M3 (air pump)");
-            ESP_LOGI(TAG_MOTOR, "M3 uses PCA9685 channels: PWM=%d, IN1=%d, IN2=%d", 
-                     MOTOR_M3_PWM, MOTOR_M3_IN1, MOTOR_M3_IN2);
+            ESP_LOGI(TAG_MOTOR, "========================================");
+            ESP_LOGI(TAG_MOTOR, "DISPENSE command - parameter=%lu grams", cmd->parameter);
+            ESP_LOGI(TAG_MOTOR, "Using DC motor on M3 for auger");
             
-            // Set direction for M3: IN1=HIGH, IN2=LOW for forward
-            ESP_LOGI(TAG_MOTOR, "Setting M3 direction: IN1=HIGH, IN2=LOW (forward)");
-            motor_set_pin(MOTOR_M3_IN1, true);   // Channel 4 = HIGH
-            motor_set_pin(MOTOR_M3_IN2, false);  // Channel 3 = LOW
+            // DC Motor Configuration
+            const uint16_t auger_speed = 2048;  // 50% PWM (~0.05-0.1A)
+            const uint32_t run_time_ms = 10000;  // 10 seconds
             
-            // PWM sweep from 0% to 100% in 10% increments
-            ESP_LOGI(TAG_MOTOR, "Starting PWM ramp UP (0%% to 100%%)");
-            for (int duty_percent = 0; duty_percent <= 100; duty_percent += 10) {
-                uint16_t pwm_value = (duty_percent * 4095) / 100;  // Convert percentage to 12-bit value
-                
-                ESP_LOGI(TAG_MOTOR, "M3 PWM: %d%% (value=%d/4095 on channel %d)", 
-                         duty_percent, pwm_value, MOTOR_M3_PWM);
-                esp_err_t ret = motor_set_pwm(MOTOR_M3_PWM, pwm_value);  // Channel 2
-                
-                if (ret != ESP_OK) {
-                    ESP_LOGE(TAG_MOTOR, "Failed to set PWM: %s", esp_err_to_name(ret));
-                } else {
-                    ESP_LOGD(TAG_MOTOR, "PWM set successfully");
-                }
-                
-                // Hold each PWM level for 500ms so we can observe/hear the change
-                vTaskDelay(pdMS_TO_TICKS(500));
+            // Ramp up
+            ESP_LOGI(TAG_MOTOR, "Ramping up...");
+            motor_set_pwm(MOTOR_M3_IN1, 4095);  // Forward direction
+            motor_set_pwm(MOTOR_M3_IN2, 0);
+            for (int s = 0; s <= auger_speed; s += 256) {
+                motor_set_pwm(MOTOR_M3_PWM, s);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            motor_set_pwm(MOTOR_M3_PWM, auger_speed);
+            
+            // Run
+            ESP_LOGI(TAG_MOTOR, "Dispensing...");
+            vTaskDelay(pdMS_TO_TICKS(run_time_ms));
+            
+            // Ramp down
+            ESP_LOGI(TAG_MOTOR, "Ramping down...");
+            for (int s = auger_speed; s >= 0; s -= 256) {
+                motor_set_pwm(MOTOR_M3_PWM, s);
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
             
-            // Sweep back down from 100% to 0%
-            ESP_LOGI(TAG_MOTOR, "Starting PWM ramp DOWN (100%% to 0%%)");
-            for (int duty_percent = 100; duty_percent >= 0; duty_percent -= 10) {
-                uint16_t pwm_value = (duty_percent * 4095) / 100;
-                
-                ESP_LOGI(TAG_MOTOR, "M3 PWM: %d%% (value=%d/4095)", duty_percent, pwm_value);
-                motor_set_pwm(MOTOR_M3_PWM, pwm_value);
-                vTaskDelay(pdMS_TO_TICKS(500));
-            }
-            
-            // Turn off motor completely
-            ESP_LOGI(TAG_MOTOR, "Releasing M3 motor (all channels OFF)");
+            // Stop (coast mode: all pins low)
             motor_set_pwm(MOTOR_M3_PWM, 0);
-            motor_set_pin(MOTOR_M3_IN1, false);
-            motor_set_pin(MOTOR_M3_IN2, false);
+            motor_set_pwm(MOTOR_M3_IN1, 0);
+            motor_set_pwm(MOTOR_M3_IN2, 0);
             
-            ESP_LOGI(TAG_MOTOR, "PWM sweep test completed");
+            ESP_LOGI(TAG_MOTOR, "Dispense complete");
+            ESP_LOGI(TAG_MOTOR, "========================================");
             break;
             
         case MOTOR_CMD_STOP:
-            ESP_LOGI(TAG_MOTOR, "STOP command received");
-            motor_stepper_release();
+            ESP_LOGI(TAG_MOTOR, "STOP command received - stopping all motors");
+            // Turn off M3 DC motor (auger) - coast mode
+            motor_set_pwm(MOTOR_M3_PWM, 0);
+            motor_set_pwm(MOTOR_M3_IN1, 0);
+            motor_set_pwm(MOTOR_M3_IN2, 0);
+            // Turn off air pump
+            motor_air_pump_control(false);
             break;
             
         case MOTOR_CMD_HOME:
             ESP_LOGI(TAG_MOTOR, "HOME command received");
-            // TODO: Implement homing logic
+            // Not applicable for DC motors
             break;
             
         case MOTOR_CMD_AIR_PUMP_ON:
@@ -491,76 +478,6 @@ esp_err_t motor_set_pwm(uint8_t channel, uint16_t value)
     return pca9685_set_pwm(channel, 0, value);
 }
 
-esp_err_t motor_set_pin(uint8_t pin, bool value)
-{
-    if (!motor_task_running) {
-        ESP_LOGE(TAG_MOTOR, "Motor control task not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    // Set pin to full ON (4095) or full OFF (0)
-    uint16_t pwm_value = value ? 4095 : 0;
-    return motor_set_pwm(pin, pwm_value);
-}
-
-esp_err_t motor_stepper_step(uint16_t steps, stepper_direction_t direction, stepper_mode_t mode)
-{
-    if (!motor_task_running) {
-        ESP_LOGE(TAG_MOTOR, "Motor control task not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    ESP_LOGI(TAG_MOTOR, "Stepper step: steps=%d, dir=%d, mode=%d", steps, direction, mode);
-    
-    // TODO: Implement stepper control logic
-    // This will be implemented in future updates
-    
-    return ESP_OK;
-}
-
-esp_err_t motor_stepper_set_speed(uint16_t rpm)
-{
-    if (!motor_task_running) {
-        ESP_LOGE(TAG_MOTOR, "Motor control task not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    if (xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        motor_state.stepper_rpm = rpm;
-        xSemaphoreGive(motor_state_mutex);
-        ESP_LOGI(TAG_MOTOR, "Stepper speed set to %d RPM", rpm);
-        return ESP_OK;
-    }
-    
-    return ESP_ERR_TIMEOUT;
-}
-
-esp_err_t motor_stepper_release(void)
-{
-    if (!motor_task_running) {
-        ESP_LOGE(TAG_MOTOR, "Motor control task not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    ESP_LOGI(TAG_MOTOR, "Releasing stepper motor coils");
-    
-    // Turn off all motor pins (M1 and M2 for stepper port 1)
-    esp_err_t ret = ESP_OK;
-    ret |= motor_set_pin(MOTOR_M1_IN1, false);
-    ret |= motor_set_pin(MOTOR_M1_IN2, false);
-    ret |= motor_set_pwm(MOTOR_M1_PWM, 0);
-    ret |= motor_set_pin(MOTOR_M2_IN1, false);
-    ret |= motor_set_pin(MOTOR_M2_IN2, false);
-    ret |= motor_set_pwm(MOTOR_M2_PWM, 0);
-    
-    if (ret == ESP_OK && xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        motor_state.stepper_enabled = false;
-        xSemaphoreGive(motor_state_mutex);
-    }
-    
-    return ret;
-}
-
 esp_err_t motor_air_pump_control(bool enable)
 {
     if (!motor_task_running) {
@@ -568,10 +485,21 @@ esp_err_t motor_air_pump_control(bool enable)
         return ESP_ERR_INVALID_STATE;
     }
     
-    ESP_LOGI(TAG_MOTOR, "Air pump: %s", enable ? "ON" : "OFF");
+    ESP_LOGI(TAG_MOTOR, "Vacuum pump (M4): %s", enable ? "ON" : "OFF");
     
-    // Use M3 for air pump control (simple on/off via PWM channel 2)
-    esp_err_t ret = motor_set_pwm(MOTOR_M3_PWM, enable ? 4095 : 0);
+    // Use M4 for vacuum/air pump control
+    esp_err_t ret = ESP_OK;
+    if (enable) {
+        // Turn on M4 at full speed
+        motor_set_pwm(MOTOR_M4_IN1, 4095);  // Forward direction
+        motor_set_pwm(MOTOR_M4_IN2, 0);
+        ret = motor_set_pwm(MOTOR_M4_PWM, 4095);  // Full speed
+    } else {
+        // Turn off M4 (coast mode)
+        motor_set_pwm(MOTOR_M4_PWM, 0);
+        motor_set_pwm(MOTOR_M4_IN1, 0);
+        ret = motor_set_pwm(MOTOR_M4_IN2, 0);
+    }
     
     if (ret == ESP_OK && xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         motor_state.air_pump_enabled = enable;

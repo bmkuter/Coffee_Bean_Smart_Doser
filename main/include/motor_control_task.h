@@ -1,7 +1,7 @@
 /*
  * Motor Control Task - PCA9685 PWM Motor Controller
  * 
- * Controls stepper motor and air pump via Adafruit Motor FeatherWing
+ * Controls DC motors and air pump via Adafruit Motor FeatherWing
  * Uses PCA9685 I2C PWM controller with TB6612 motor drivers
  */
 
@@ -59,7 +59,7 @@
 #define PCA9685_PWM_RESOLUTION      4096    // 12-bit PWM resolution
 
 // Motor Channel Definitions (per Adafruit Motor Shield V2 mapping)
-// Stepper 1 uses M1 (PWM 8,9,10) and M2 (PWM 13,12,11)
+// DC Motors: M1, M2, M3 (auger), M4 (vacuum pump)
 #define MOTOR_M1_PWM                8       // Motor 1 PWM pin on PCA9685
 #define MOTOR_M1_IN2                9       // Motor 1 IN2 pin
 #define MOTOR_M1_IN1                10      // Motor 1 IN1 pin
@@ -67,42 +67,23 @@
 #define MOTOR_M2_IN2                12      // Motor 2 IN2 pin
 #define MOTOR_M2_IN1                11      // Motor 2 IN1 pin
 
-// Stepper 2 uses M3 (PWM 2,3,4) and M4 (PWM 7,6,5)
-#define MOTOR_M3_PWM                2       // Motor 3 PWM pin
+#define MOTOR_M3_PWM                2       // Motor 3 PWM pin (auger motor)
 #define MOTOR_M3_IN2                3       // Motor 3 IN2 pin
 #define MOTOR_M3_IN1                4       // Motor 3 IN1 pin
-#define MOTOR_M4_PWM                7       // Motor 4 PWM pin
+#define MOTOR_M4_PWM                7       // Motor 4 PWM pin (vacuum pump)
 #define MOTOR_M4_IN2                6       // Motor 4 IN2 pin
 #define MOTOR_M4_IN1                5       // Motor 4 IN1 pin
-
-// Stepper Motor Configuration
-#define STEPPER_STEPS_PER_REV       200     // Standard NEMA-17 (1.8 deg/step)
-#define STEPPER_PORT                1       // Use stepper port 1 (M1+M2)
 
 // Task Configuration
 #define MOTOR_TASK_STACK_SIZE       4096
 #define MOTOR_TASK_PRIORITY         2       // Lower priority than ADC/Display
 #define MOTOR_TASK_CORE             0       // Run on core 0
 
-// Stepper modes
-typedef enum {
-    STEPPER_MODE_SINGLE = 0,    // Single coil activation (lower power, less torque)
-    STEPPER_MODE_DOUBLE,        // Double coil activation (higher torque)
-    STEPPER_MODE_INTERLEAVE,    // Interleaved single/double (half-stepping)
-    STEPPER_MODE_MICROSTEP      // Microstepping (smoothest motion)
-} stepper_mode_t;
-
-// Stepper direction
-typedef enum {
-    STEPPER_FORWARD = 0,
-    STEPPER_BACKWARD
-} stepper_direction_t;
-
 // Motor command types
 typedef enum {
     MOTOR_CMD_DISPENSE = 0,     // Start dispensing operation (from double-click)
     MOTOR_CMD_STOP,             // Stop current operation
-    MOTOR_CMD_HOME,             // Home the stepper motor
+    MOTOR_CMD_HOME,             // Reserved for future use
     MOTOR_CMD_AIR_PUMP_ON,      // Turn on air pump
     MOTOR_CMD_AIR_PUMP_OFF      // Turn off air pump
 } motor_command_type_t;
@@ -116,10 +97,7 @@ typedef struct {
 // Motor state structure
 typedef struct {
     bool initialized;
-    bool stepper_enabled;
     bool air_pump_enabled;
-    uint16_t stepper_rpm;
-    uint32_t stepper_position;  // Current position in steps
 } motor_state_t;
 
 /**
@@ -152,49 +130,15 @@ esp_err_t motor_get_state(motor_state_t* state);
  * @brief Set PWM value for a specific PCA9685 channel
  * 
  * @param channel PWM channel (0-15)
- * @param value PWM value (0-4095, 12-bit)
+ * @param value PWM value (0-4095, 12-bit). Use 4095 for digital HIGH, 0 for LOW
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t motor_set_pwm(uint8_t channel, uint16_t value);
 
 /**
- * @brief Set pin to digital HIGH or LOW
+ * @brief Control vacuum pump on M4 (on/off)
  * 
- * @param pin PWM channel to use as digital pin (0-15)
- * @param value true for HIGH (4095), false for LOW (0)
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t motor_set_pin(uint8_t pin, bool value);
-
-/**
- * @brief Move stepper motor a specific number of steps
- * 
- * @param steps Number of steps to move
- * @param direction Direction to move (FORWARD or BACKWARD)
- * @param mode Stepping mode (SINGLE, DOUBLE, INTERLEAVE, MICROSTEP)
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t motor_stepper_step(uint16_t steps, stepper_direction_t direction, stepper_mode_t mode);
-
-/**
- * @brief Set stepper motor speed
- * 
- * @param rpm Revolutions per minute (1-200 typical)
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t motor_stepper_set_speed(uint16_t rpm);
-
-/**
- * @brief Release stepper motor coils (allows free spinning)
- * 
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t motor_stepper_release(void);
-
-/**
- * @brief Control air pump (on/off)
- * 
- * @param enable true to turn on pump, false to turn off
+ * @param enable true to turn on pump at full speed, false to turn off
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t motor_air_pump_control(bool enable);
