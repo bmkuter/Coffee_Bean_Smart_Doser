@@ -197,18 +197,19 @@ static void rotary_encoder_task(void* pvParameters)
     bool last_button_state = false;
     bool last_raw_button_state = false;
     TickType_t button_change_time = 0;
-    const TickType_t button_debounce_ticks = pdMS_TO_TICKS(25);  // 25ms debounce
+    const TickType_t button_debounce_ticks = pdMS_TO_TICKS(20);  // 250ms debounce
     
     // Long press detection for reset functionality
     TickType_t button_press_start = 0;
-    const TickType_t long_press_duration = pdMS_TO_TICKS(500);  // 500ms long press
+    const TickType_t long_press_duration = pdMS_TO_TICKS(1250);  // 1250ms long press
     bool long_press_triggered = false;
     bool showing_long_press_feedback = false;
     
-    // Double-click detection
+    // Multi-click detection (double-click)
     TickType_t first_click_time = 0;
-    const TickType_t double_click_window = pdMS_TO_TICKS(400);  // 400ms window for double-click
-    bool waiting_for_second_click = false;
+    const TickType_t click_window = pdMS_TO_TICKS(450);  // 450ms window between clicks
+    int click_count = 0;  // Track number of clicks
+    bool waiting_for_next_click = false;
     
     // Rate limiting for display updates
     TickType_t last_display_update = 0;
@@ -260,9 +261,21 @@ static void rotary_encoder_task(void* pvParameters)
         if (ret == ESP_OK) {
             TickType_t current_time = xTaskGetTickCount();
             
-            // Check if double-click window has expired
-            if (waiting_for_second_click && (current_time - first_click_time) >= double_click_window) {
-                waiting_for_second_click = false;  // Window expired, reset
+            // Check if multi-click window has expired - fire single click if needed
+            if (waiting_for_next_click && click_count == 1) {
+                TickType_t time_since_first_click = current_time - first_click_time;
+                    
+                if (time_since_first_click >= click_window) {
+                    // Window expired with only one click - fire single click event
+                    ESP_LOGI(TAG_ROTARY, "Single click detected (window expired)");
+                    waiting_for_next_click = false;
+                    click_count = 0;
+                    
+                    // Fire single click callback
+                    if (event_callback != NULL) {
+                        event_callback(ROTARY_EVENT_BUTTON_RELEASE, rotary_data.position, 0);
+                    }
+                }
             }
             
             // Check if raw button state has changed
@@ -303,32 +316,62 @@ static void rotary_encoder_task(void* pvParameters)
 
                         xSemaphoreGive(rotary_data_mutex);
 
-                        // Double-click detection on button release
+                        // Multi-click detection on button release
                         if (!raw_button_pressed) {  // Button was just released
-                            if (waiting_for_second_click && (current_time - first_click_time) < double_click_window) {
-                                // Second click detected within window - this is a double-click!
-                                ESP_LOGI(TAG_ROTARY, "Double-click detected!");
-                                waiting_for_second_click = false;
-                                
-                                // Update event to double-click
-                                event = ROTARY_EVENT_DOUBLE_CLICK;
-                                if (xSemaphoreTake(rotary_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                    rotary_data.last_event = event;
-                                    xSemaphoreGive(rotary_data_mutex);
+                            click_count++;
+                            
+                            if (click_count == 1) {
+                                // First click - start waiting to see if more clicks come
+                                first_click_time = current_time;
+                                waiting_for_next_click = true;
+                                ESP_LOGD(TAG_ROTARY, "First click - waiting for potential multi-click");
+                                // Don't call callback yet - wait for window to expire
+                            } else if (click_count == 2) {
+                                // Second click - check if within window
+                                if ((current_time - first_click_time) < click_window) {
+                                    // Valid double-click - fire immediately
+                                    ESP_LOGI(TAG_ROTARY, "Double-click detected!");
+                                    waiting_for_next_click = false;
+                                    click_count = 0;
+                                    
+                                    event = ROTARY_EVENT_DOUBLE_CLICK;
+                                    if (xSemaphoreTake(rotary_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                        rotary_data.last_event = event;
+                                        xSemaphoreGive(rotary_data_mutex);
+                                    }
+                                    
+                                    // Call callback for double-click
+                                    if (event_callback != NULL) {
+                                        event_callback(event, rotary_data.position, 0);
+                                    }
+                                } else {
+                                    // Second click too slow - treat first click as single, start new sequence
+                                    ESP_LOGI(TAG_ROTARY, "Single click detected (timeout)");
+                                    
+                                    // Fire single click callback for the first click
+                                    event = ROTARY_EVENT_BUTTON_RELEASE;
+                                    if (event_callback != NULL) {
+                                        event_callback(event, rotary_data.position, 0);
+                                    }
+                                    
+                                    // Start new sequence with this click
+                                    click_count = 1;
+                                    first_click_time = current_time;
+                                    waiting_for_next_click = true;
                                 }
                             } else {
-                                // First click - start waiting for second click
+                                // More than 2 clicks - reset (we don't use triple-click anymore)
+                                click_count = 1;
                                 first_click_time = current_time;
-                                waiting_for_second_click = true;
+                                waiting_for_next_click = true;
+                            }
+                        } else {
+                            // Button press event - only call callback for press events
+                            ESP_LOGI(TAG_ROTARY, "Button: PRESSED (debounced)");
+                            if (event_callback != NULL) {
+                                event_callback(ROTARY_EVENT_BUTTON_PRESS, rotary_data.position, 0);
                             }
                         }
-
-                        // Call callback if registered
-                        if (event_callback != NULL) {
-                            event_callback(event, rotary_data.position, 0);
-                        }
-
-                        ESP_LOGI(TAG_ROTARY, "Button: %s (debounced)", raw_button_pressed ? "PRESSED" : "RELEASED");
 
                         // Mark for rate-limited display update instead of immediate send
                         latest_position = rotary_data.position;

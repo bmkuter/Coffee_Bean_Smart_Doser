@@ -867,23 +867,26 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
     (void)position;  // Unused parameter
     (void)delta;     // Unused parameter
     
-    if (event == ROTARY_EVENT_DOUBLE_CLICK) {
-        ESP_LOGI(TAG_NAU7802, "Double-click detected - sending dispense command to motor task");
+    // NEW BUTTON MAPPING:
+    // Single Click = Reset encoder position (dosage setting)
+    // Double Click = Tare scales
+    // Long Press = Calibrate with 358.2g weight
+    
+    if (event == ROTARY_EVENT_BUTTON_RELEASE) {
+        // Single click - Reset encoder position to 0 (for dosage weight setting)
+        ESP_LOGI(TAG_NAU7802, "Single click detected - resetting encoder position to 0");
         
-        // Show "DISPENSING" notification on display for 2 seconds
-        display_send_system_status("  DISPENSING", false, 2000);
-        
-        // Send dispense command to motor control task
-        // Parameter could be target weight from encoder position or a fixed amount
-        uint32_t target_grams = 20;  // Example: dispense 20 grams
-        esp_err_t ret = motor_send_command(MOTOR_CMD_DISPENSE, target_grams);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG_NAU7802, "Dispense command sent to motor task (target: %lu grams)", target_grams);
+        esp_err_t encoder_ret = rotary_encoder_set_position(0);
+        if (encoder_ret == ESP_OK) {
+            ESP_LOGI(TAG_NAU7802, "Encoder position reset to 0g (dosage cleared)");
+            display_send_system_status("Dosage Reset", false, 1000);
         } else {
-            ESP_LOGW(TAG_NAU7802, "Failed to send dispense command: %s", esp_err_to_name(ret));
+            ESP_LOGW(TAG_NAU7802, "Failed to reset encoder position: %s", esp_err_to_name(encoder_ret));
         }
-    } else if (event == ROTARY_EVENT_LONG_PRESS) {
-        ESP_LOGI(TAG_NAU7802, "Rotary encoder long press detected - taring scale...");
+        
+    } else if (event == ROTARY_EVENT_DOUBLE_CLICK) {
+        // Double click - Tare scales
+        ESP_LOGI(TAG_NAU7802, "Double-click detected - taring scales...");
         
         bool any_tared = false;
         
@@ -909,27 +912,85 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         }
         
         if (any_tared) {
-            ESP_LOGI(TAG_NAU7802, "✓ Scale tared - all connected channels zeroed");
+            ESP_LOGI(TAG_NAU7802, "✓ Scales tared - all connected channels zeroed");
             
-            // Reset rotary encoder position to 0 as part of the tare/reset operation
+            // Also reset encoder position after tare
             esp_err_t encoder_ret = rotary_encoder_set_position(0);
             if (encoder_ret == ESP_OK) {
-                ESP_LOGI(TAG_NAU7802, "Rotary encoder position reset to 0");
+                ESP_LOGI(TAG_NAU7802, "Encoder position reset to 0");
             } else {
                 ESP_LOGW(TAG_NAU7802, "Failed to reset encoder position: %s", esp_err_to_name(encoder_ret));
             }
             
             // Note: Display will automatically update once tare_in_progress flag is cleared by tare function
-            // No need for manual display update here - the main loop will handle it
         } else if (!channel_a_connected && !channel_b_connected) {
             ESP_LOGW(TAG_NAU7802, "No strain gauges connected - cannot tare scale");
-            // Send error message to display (3 seconds)
             display_send_system_status("NO SCALE", true, 3000);
         } else {
             ESP_LOGW(TAG_NAU7802, "Failed to tare any connected channels");
-            // Send error message to display (3 seconds)
             display_send_system_status("TARE FAILED", true, 3000);
         }
+        
+    } else if (event == ROTARY_EVENT_LONG_PRESS) {
+        // Long press - Calibrate with 358.2g weight
+        ESP_LOGI(TAG_NAU7802, "Long press detected - starting calibration with 358.2g weight");
+        
+        // Calibrate Channel A (Container)
+        if (channel_a_connected) {
+            display_send_system_status("Ch A: 358.2g", false, 0);  // Indefinite
+            vTaskDelay(pdMS_TO_TICKS(2000));  // Give user time to read
+            
+            esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_1, 358.2f);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG_NAU7802, "Channel A calibrated with 358.2g weight");
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Failed to calibrate Channel A: %s", esp_err_to_name(ret));
+            }
+        }
+        
+        // Calibrate Channel B if connected - wait for user confirmation
+        if (channel_b_connected) {
+            // Show instruction to move weight and press button when ready
+            display_send_system_status("Move to Ch B", false, 3000);  // Indefinite
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            display_send_system_status("Press when OK", false, 0);  // Indefinite
+            
+            // Wait for button press confirmation
+            ESP_LOGI(TAG_NAU7802, "Waiting for button press to calibrate Channel B...");
+            
+            // Simple blocking wait for button press (check button state every 100ms)
+            bool button_pressed = false;
+            while (!button_pressed) {
+                rotary_encoder_data_t rotary_data;
+                if (rotary_encoder_get_data(&rotary_data) == ESP_OK) {
+                    if (rotary_data.button_pressed) {
+                        button_pressed = true;
+                        ESP_LOGI(TAG_NAU7802, "Button press detected - proceeding with Channel B calibration");
+                        
+                        // Wait for button release
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        while (rotary_data.button_pressed) {
+                            vTaskDelay(pdMS_TO_TICKS(50));
+                            rotary_encoder_get_data(&rotary_data);
+                        }
+                        break;
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            
+            // Now calibrate Channel B
+            esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_2, 358.2f);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG_NAU7802, "Channel B calibrated with 358.2g weight");
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Failed to calibrate Channel B: %s", esp_err_to_name(ret));
+            }
+        }
+        
+        // Show completion message
+        display_send_system_status("Cal Complete!", false, 2000);
+        ESP_LOGI(TAG_NAU7802, "Calibration sequence complete");
     }
 }
 
@@ -1180,6 +1241,96 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
     return ESP_ERR_TIMEOUT;
 }
 
+// Calibrate scale with a known weight
+esp_err_t nau7802_calibrate_channel(nau7802_channel_t channel, float known_weight_grams)
+{
+    ESP_LOGI(TAG_NAU7802, "Calibrating channel %d with known weight: %.1fg", channel, known_weight_grams);
+    
+    if (known_weight_grams <= 0.0f) {
+        ESP_LOGE(TAG_NAU7802, "Invalid known weight: %.1fg (must be > 0)", known_weight_grams);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Show calibration message
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Calibrating %.1fg", known_weight_grams);
+    display_send_system_status(msg, false, 0);  // Indefinite
+    
+    // Wait for physical stability
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    nau7802_calibration_t* cal = (channel == NAU7802_CHANNEL_1) ? &channel_a_cal : &channel_b_cal;
+    
+    // Collect multiple readings for stable calibration
+    const int num_samples = 20;  // 20 samples over 1 second
+    int32_t cal_samples[num_samples];
+    int valid_samples = 0;
+    
+    for (int i = 0; i < num_samples; i++) {
+        esp_err_t ret = nau7802_select_channel(channel);
+        if (ret == ESP_OK) {
+            ret = nau7802_wait_for_data_ready(100);
+            if (ret == ESP_OK) {
+                int32_t raw_value;
+                ret = nau7802_read_adc_raw(&raw_value);
+                if (ret == ESP_OK) {
+                    cal_samples[valid_samples] = raw_value;
+                    valid_samples++;
+                    ESP_LOGD(TAG_NAU7802, "Cal sample %d: %ld", valid_samples, raw_value);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    if (valid_samples < 5) {
+        ESP_LOGE(TAG_NAU7802, "Insufficient samples for calibration (%d/20)", valid_samples);
+        display_send_system_status("Cal Failed!", true, 2000);
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // Calculate average reading
+    int64_t sum = 0;
+    for (int i = 0; i < valid_samples; i++) {
+        sum += cal_samples[i];
+    }
+    int32_t averaged_reading = (int32_t)(sum / valid_samples);
+    
+    ESP_LOGI(TAG_NAU7802, "Calibration average from %d samples: %ld", valid_samples, averaged_reading);
+    
+    // Calculate new scale factor
+    // scale_factor = (raw_value - zero_offset) / known_weight
+    int32_t reading_above_tare = averaged_reading - cal->zero_offset;
+    
+    if (reading_above_tare <= 0) {
+        ESP_LOGE(TAG_NAU7802, "Invalid calibration: reading (%ld) not above tare (%ld)", 
+                 averaged_reading, cal->zero_offset);
+        display_send_system_status("Cal Error!", true, 2000);
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    float new_scale_factor = (float)reading_above_tare / known_weight_grams;
+    
+    ESP_LOGI(TAG_NAU7802, "New scale factor: %.4f (was %.4f)", new_scale_factor, cal->scale_factor);
+    ESP_LOGI(TAG_NAU7802, "Calibration: %ld counts = %.1fg, factor = %.4f counts/gram", 
+             reading_above_tare, known_weight_grams, new_scale_factor);
+    
+    if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        cal->scale_factor = new_scale_factor;
+        cal->is_calibrated = true;
+        xSemaphoreGive(nau7802_data_mutex);
+        
+        // Show success message
+        display_send_system_status("Cal Success!", false, 2000);
+        
+        ESP_LOGI(TAG_NAU7802, "Channel %d calibrated successfully", channel);
+        return ESP_OK;
+    }
+    
+    display_send_system_status("Cal Failed!", true, 2000);
+    return ESP_ERR_TIMEOUT;
+}
+
 esp_err_t nau7802_set_gain(nau7802_gain_t gain)
 {
     uint8_t ctrl1_val;
@@ -1427,7 +1578,7 @@ esp_err_t nau7802_kalman_set_parameters(kalman_filter_t* kf, float process_noise
     return ESP_OK;
 }
 
-// Enhanced weight conversion with Kalman filtering
+// Enhanced weight conversion with adaptive Kalman filtering
 static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms, const char* channel_name)
 {
     // Basic weight conversion
@@ -1442,22 +1593,6 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         raw_weight = ch_data->last_stable_weight;
     } else {
         ch_data->last_stable_weight = raw_weight;
-    }
-    
-    // Apply simple moving average for additional smoothing
-    ch_data->avg_buffer[ch_data->avg_index] = raw_weight;
-    ch_data->avg_index = (ch_data->avg_index + 1) % NAU7802_SAMPLE_AVERAGE;
-    if (!ch_data->avg_filled && ch_data->avg_index == 0) {
-        ch_data->avg_filled = true;
-    }
-    
-    // Calculate moving average if buffer has enough samples
-    if (ch_data->avg_filled) {
-        float sum = 0.0f;
-        for (int i = 0; i < NAU7802_SAMPLE_AVERAGE; i++) {
-            sum += ch_data->avg_buffer[i];
-        }
-        raw_weight = sum / (float)NAU7802_SAMPLE_AVERAGE;  // Fast moving average for quick response
     }
 
     // Initialize Kalman filter if not done yet
@@ -1477,7 +1612,7 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         ch_data->confidence = 0.5f;  // Medium confidence initially
         ch_data->last_stable_weight = raw_weight;  // Initialize deadband filter
         
-        // Initialize moving average buffer
+        // Initialize moving average buffer with first reading
         for (int i = 0; i < NAU7802_SAMPLE_AVERAGE; i++) {
             ch_data->avg_buffer[i] = raw_weight;
         }
@@ -1489,8 +1624,56 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         return raw_weight;
     }
     
-    // Update Kalman filter with moving averaged measurement
-    esp_err_t ret = nau7802_kalman_update(&ch_data->kf, raw_weight, timestamp_ms);
+    // First, get Kalman prediction to calculate innovation BEFORE updating the average buffer
+    // This allows us to detect significant changes and adapt the averaging accordingly
+    float predicted_weight = ch_data->kf.state[0];  // Get current Kalman prediction
+    float innovation = fabsf(raw_weight - predicted_weight);  // Calculate innovation magnitude
+    
+    // Adaptive buffer filling based on innovation (Kalman-detected significant change)
+    // Large innovations indicate real weight changes - fill buffer faster
+    // Small innovations indicate noise - use normal averaging
+    
+    // Innovation thresholds for adaptive behavior:
+    // < 2g   = noise, use single sample (normal averaging)
+    // 2-10g  = small change, use 25% buffer fill
+    // 10-50g = medium change, use 50% buffer fill  
+    // > 50g  = large change (like adding 358g weight), use 75% buffer fill
+    
+    int samples_to_fill = 1;  // Default: single sample (normal operation)
+    
+    if (innovation > 50.0f) {
+        // Very large change detected - rapidly fill 75% of buffer
+        samples_to_fill = (NAU7802_SAMPLE_AVERAGE * 3) / 4;  // 75% of buffer (6 out of 8)
+    } else if (innovation > 10.0f) {
+        // Medium change - fill 50% of buffer
+        samples_to_fill = NAU7802_SAMPLE_AVERAGE / 2;  // 50% of buffer (4 out of 8)
+    } else if (innovation > 2.0f) {
+        // Small but real change - fill 25% of buffer
+        samples_to_fill = NAU7802_SAMPLE_AVERAGE / 4;  // 25% of buffer (2 out of 8)
+    }
+    // else: innovation <= 2g, keep samples_to_fill = 1 (normal single sample)
+    
+    // Fill the buffer adaptively based on detected change magnitude
+    for (int i = 0; i < samples_to_fill; i++) {
+        ch_data->avg_buffer[ch_data->avg_index] = raw_weight;
+        ch_data->avg_index = (ch_data->avg_index + 1) % NAU7802_SAMPLE_AVERAGE;
+        if (!ch_data->avg_filled && ch_data->avg_index == 0) {
+            ch_data->avg_filled = true;
+        }
+    }
+    
+    // Calculate moving average from buffer
+    float averaged_weight = raw_weight;  // Default if buffer not filled
+    if (ch_data->avg_filled) {
+        float sum = 0.0f;
+        for (int i = 0; i < NAU7802_SAMPLE_AVERAGE; i++) {
+            sum += ch_data->avg_buffer[i];
+        }
+        averaged_weight = sum / (float)NAU7802_SAMPLE_AVERAGE;
+    }
+    
+    // Now update Kalman filter with the averaged measurement
+    esp_err_t ret = nau7802_kalman_update(&ch_data->kf, averaged_weight, timestamp_ms);
     if (ret == ESP_OK) {
         // Extract filtered values from Kalman filter
         ch_data->filtered_weight = ch_data->kf.state[0];
@@ -1498,7 +1681,6 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
         ch_data->acceleration = ch_data->kf.state[2];
         
         // Calculate confidence based on innovation and measurement consistency
-        float innovation = fabsf(raw_weight - ch_data->filtered_weight);
         float max_innovation = 5.0f;  // 5g maximum expected innovation for good confidence (tighter with better scale factor)
         ch_data->confidence = fmaxf(0.0f, fminf(1.0f, 1.0f - (innovation / max_innovation)));
         

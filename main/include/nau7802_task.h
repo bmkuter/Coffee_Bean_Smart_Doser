@@ -25,7 +25,7 @@ extern "C" {
 #define NAU7802_TASK_STACK_SIZE     4096
 #define NAU7802_TASK_PRIORITY       3        // Lower than display for better queue processing
 #define NAU7802_POLL_RATE_MS        20       // 50 Hz polling for 40 SPS ADC (1.25x faster than ADC rate for reliable capture)
-#define NAU7802_SAMPLE_AVERAGE      4        // Number of samples to average for stability
+#define NAU7802_SAMPLE_AVERAGE      8        // Number of samples to average for stability
 
 // NAU7802 Register Definitions (from datasheet)
 #define NAU7802_REG_PU_CTRL         0x00    // Power control

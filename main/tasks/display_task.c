@@ -108,13 +108,15 @@ esp_err_t display_task_init(void)
     // Clear display and show initial encoder display layout
     ssd1306_clear_screen(&ssd1306_dev, false);
 
-    // Draw ASCII Coffee Bean Startup Logo
-    ssd1306_display_text(&ssd1306_dev, 1, "   .-\"\"\"\"\"-.", 11, false);
-    ssd1306_display_text(&ssd1306_dev, 2, "  /  Coffee \\", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 3, " |   Bean   |", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 4, " |   Smart  |", 13, false);
-    ssd1306_display_text(&ssd1306_dev, 5, "  \\ Doser  /", 12, false);
-    ssd1306_display_text(&ssd1306_dev, 6, "   '-.....-'", 12, false);
+    // Draw Baba Java (Baba Yaga Coffee Doser) Startup Logo
+    ssd1306_display_text(&ssd1306_dev, 0, "   BABA JAVA", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 1, " _____________", 14, false);
+    ssd1306_display_text(&ssd1306_dev, 2, "|_____===_____|", 15, false);
+    ssd1306_display_text(&ssd1306_dev, 3, "| .-. |~| .-. |", 15, false);
+    ssd1306_display_text(&ssd1306_dev, 4, "| |_| |_| |_| |", 15, false);
+    ssd1306_display_text(&ssd1306_dev, 5, "|_____|_|_____|", 15, false);
+    ssd1306_display_text(&ssd1306_dev, 6, "   /|     |\\", 13, false);
+    ssd1306_display_text(&ssd1306_dev, 7, "  /_|     |_\\", 14, false);
 
     ESP_LOGI(TAG_DISPLAY, "Display task initialized successfully");
     return ESP_OK;
