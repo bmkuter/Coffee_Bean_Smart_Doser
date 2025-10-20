@@ -33,3 +33,5 @@ sdkconfig.old
 pytest_blink.py
 
 debug.log
+
+*.trace

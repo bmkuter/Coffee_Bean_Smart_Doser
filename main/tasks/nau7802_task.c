@@ -22,6 +22,9 @@
 #include <string.h>
 #include <math.h>
 
+// Debug tracing
+#define TRACING_ENABLED 0  // Set to 0 to disable timing measurements
+
 // NVS Storage constants
 #define NVS_NAMESPACE "nau7802"
 #define NVS_KEY_TARE_A "tare_a"
@@ -201,23 +204,57 @@ static void nau7802_task_function(void* pvParameters)
     uint32_t channel_b_samples = 0;
     uint32_t error_count = 0;
     uint32_t last_error_log = 0;
+#if TRACING_ENABLED
+    uint32_t last_loop_end_time = 0;  // Track end time of previous iteration
+#endif
 
     while (nau7802_task_running) {
         esp_err_t ret;
         bool channel_a_success = false;
         bool channel_b_success = false;
+        
+#if TRACING_ENABLED
+        // Timing measurement for loop iteration
+        uint32_t loop_start_time = esp_timer_get_time() / 1000;  // Start time in ms
+        uint32_t time_since_last_iteration = (last_loop_end_time == 0) ? 0 : (loop_start_time - last_loop_end_time);
+        
+        // Detailed timing variables for Channel A (initialize all to handle error paths)
+        uint32_t ch_a_start, ch_a_select_done, ch_a_flush_done, ch_a_read_done = 0, ch_a_convert_done = 0;
+        
+        // Detailed timing variables for Channel B (initialize all to handle error paths)
+        uint32_t ch_b_start, ch_b_select_done, ch_b_flush_done, ch_b_read_done = 0, ch_b_convert_done = 0;
+#endif
 
-        // Read Channel A (Container Weight)
+        // ==================== Channel A (Container Weight) ====================
+#if TRACING_ENABLED
+        ch_a_start = esp_timer_get_time() / 1000;
+#endif
         ret = nau7802_select_channel(NAU7802_CHANNEL_1);
+#if TRACING_ENABLED
+        ch_a_select_done = esp_timer_get_time() / 1000;
+#endif
+        
         if (ret == ESP_OK) {
             // Flush the buffer to eliminate cross-contamination from Channel B
             ret = nau7802_flush_channel_buffer(NAU7802_CHANNEL_1);
+#if TRACING_ENABLED
+            ch_a_flush_done = esp_timer_get_time() / 1000;
+#endif
+        } else {
+#if TRACING_ENABLED
+            ch_a_flush_done = ch_a_select_done;
+#endif
         }
+        
         if (ret == ESP_OK) {
             ret = nau7802_wait_for_data_ready(50);  // Timeout based on 80 SPS = 12.5ms per sample + margin
             if (ret == ESP_OK) {
                 int32_t raw_value;
                 ret = nau7802_read_adc_raw(&raw_value);
+#if TRACING_ENABLED
+                ch_a_read_done = esp_timer_get_time() / 1000;
+#endif
+                
                 if (ret == ESP_OK) {
                     // Update Channel A data
                     if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -225,12 +262,17 @@ static void nau7802_task_function(void* pvParameters)
                         
                         nau7802_data.channel_a.raw_value = raw_value;
                         nau7802_data.channel_a.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_a_cal, &nau7802_data.channel_a, timestamp_ms, "Channel A");
+#if TRACING_ENABLED
+                        ch_a_convert_done = esp_timer_get_time() / 1000;
+#endif
                         nau7802_data.channel_a.data_ready = true;
                         nau7802_data.channel_a.timestamp = timestamp_ms;
                         nau7802_data.channel_a.sample_count = ++channel_a_samples;
                         nau7802_data.total_conversions++;
                         xSemaphoreGive(nau7802_data_mutex);
-
+#if TRACING_ENABLED                
+                        ch_a_convert_done = esp_timer_get_time() / 1000;
+#endif
                         // Check if the weight value indicates a disconnected sensor
                         // Temporarily disabled to allow re-taring after gain change
                         if (false && nau7802_data.channel_a.weight_grams < -900.0f) {
@@ -260,10 +302,19 @@ static void nau7802_task_function(void* pvParameters)
                 ESP_LOGD(TAG_NAU7802, "Channel A data ready timeout: %s", esp_err_to_name(ret));
                 channel_a_consecutive_errors++;
             }
+#if TRACING_ENABLED
+            // Set read_done if not already set (error path)
+            if (ch_a_read_done == 0) ch_a_read_done = esp_timer_get_time() / 1000;
+#endif
         } else {
             ESP_LOGW(TAG_NAU7802, "Failed to select Channel A: %s", esp_err_to_name(ret));
             channel_a_consecutive_errors++;
         }
+        
+#if TRACING_ENABLED
+        // Ensure convert_done is set (error paths may skip conversion)
+        if (ch_a_convert_done == 0) ch_a_convert_done = esp_timer_get_time() / 1000;
+#endif
         
         // Check if Channel A should be considered disconnected
         if (channel_a_consecutive_errors >= MAX_CONSECUTIVE_ERRORS && channel_a_connected) {
@@ -278,17 +329,36 @@ static void nau7802_task_function(void* pvParameters)
         ESP_LOGD(TAG_NAU7802, "Channel A (Container) weight: %.1fg", weight_a);
         display_send_individual_weight(weight_a, 0);  // Channel 0 = Container
 
-        // Read Channel B (Dosage Cup Weight)
+        // ==================== Channel B (Dosage Cup Weight) ====================
+#if TRACING_ENABLED
+        ch_b_start = esp_timer_get_time() / 1000;
+#endif
         ret = nau7802_select_channel(NAU7802_CHANNEL_2);
+#if TRACING_ENABLED
+        ch_b_select_done = esp_timer_get_time() / 1000;
+#endif
+        
         if (ret == ESP_OK) {
             // Flush the buffer to eliminate cross-contamination from Channel A
             ret = nau7802_flush_channel_buffer(NAU7802_CHANNEL_2);
+#if TRACING_ENABLED
+            ch_b_flush_done = esp_timer_get_time() / 1000;
+#endif
+        } else {
+#if TRACING_ENABLED
+            ch_b_flush_done = ch_b_select_done;
+#endif
         }
+        
         if (ret == ESP_OK) {
             ret = nau7802_wait_for_data_ready(50);  // Timeout based on 80 SPS = 12.5ms per sample + margin
             if (ret == ESP_OK) {
                 int32_t raw_value;
                 ret = nau7802_read_adc_raw(&raw_value);
+#if TRACING_ENABLED
+                ch_b_read_done = esp_timer_get_time() / 1000;
+#endif
+                
                 if (ret == ESP_OK) {
                     // Update Channel B data with filtered weight
                     if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -296,12 +366,17 @@ static void nau7802_task_function(void* pvParameters)
                         
                         nau7802_data.channel_b.raw_value = raw_value;
                         nau7802_data.channel_b.weight_grams = nau7802_raw_to_weight_filtered(raw_value, &channel_b_cal, &nau7802_data.channel_b, timestamp_ms, "Channel B");
+#if TRACING_ENABLED
+                        ch_b_convert_done = esp_timer_get_time() / 1000;
+#endif
                         nau7802_data.channel_b.data_ready = true;
                         nau7802_data.channel_b.timestamp = timestamp_ms;
                         nau7802_data.channel_b.sample_count = ++channel_b_samples;
                         nau7802_data.total_conversions++;
                         xSemaphoreGive(nau7802_data_mutex);
-
+#if TRACING_ENABLED                  
+                        ch_b_convert_done = esp_timer_get_time() / 1000;
+#endif
                         // Check if the weight value indicates a disconnected sensor
                         // Temporarily disabled to allow re-taring after gain change
                         if (false && nau7802_data.channel_b.weight_grams < -900.0f) {
@@ -331,10 +406,19 @@ static void nau7802_task_function(void* pvParameters)
                 ESP_LOGD(TAG_NAU7802, "Channel B data ready timeout: %s", esp_err_to_name(ret));
                 channel_b_consecutive_errors++;
             }
+#if TRACING_ENABLED
+            // Set read_done if not already set (error path)
+            if (ch_b_read_done == 0) ch_b_read_done = esp_timer_get_time() / 1000;
+#endif
         } else {
             ESP_LOGW(TAG_NAU7802, "Failed to select Channel B: %s", esp_err_to_name(ret));
             channel_b_consecutive_errors++;
         }
+        
+#if TRACING_ENABLED
+        // Ensure convert_done is set (error paths may skip conversion)
+        if (ch_b_convert_done == 0) ch_b_convert_done = esp_timer_get_time() / 1000;
+#endif
         
         // Check if Channel B should be considered disconnected
         if (channel_b_consecutive_errors >= MAX_CONSECUTIVE_ERRORS && channel_b_connected) {
@@ -346,6 +430,39 @@ static void nau7802_task_function(void* pvParameters)
         float weight_b = (tare_in_progress) ? WEIGHT_DISPLAY_TARING :
                          (channel_b_connected) ? nau7802_data.channel_b.weight_grams : WEIGHT_DISPLAY_NO_CONN;
         display_send_individual_weight(weight_b, 1);  // Channel 1 = Dosage
+        
+#if TRACING_ENABLED
+        // ==================== Timing Summary ====================
+        // Calculate individual step durations for both channels
+        uint32_t ch_a_select_time = ch_a_select_done - ch_a_start;
+        uint32_t ch_a_flush_time = ch_a_flush_done - ch_a_select_done;
+        uint32_t ch_a_read_time = ch_a_read_done - ch_a_flush_done;
+        uint32_t ch_a_convert_time = ch_a_convert_done - ch_a_read_done;
+        uint32_t ch_a_total = ch_a_convert_done - ch_a_start;
+        
+        uint32_t ch_b_select_time = ch_b_select_done - ch_b_start;
+        uint32_t ch_b_flush_time = ch_b_flush_done - ch_b_select_done;
+        uint32_t ch_b_read_time = ch_b_read_done - ch_b_flush_done;
+        uint32_t ch_b_convert_time = ch_b_convert_done - ch_b_read_done;
+        uint32_t ch_b_total = ch_b_convert_done - ch_b_start;
+        
+        // Calculate total loop time
+        uint32_t loop_end_time = esp_timer_get_time() / 1000;
+        uint32_t total_loop_duration = loop_end_time - loop_start_time;
+        
+        // Log detailed timing information in well-formatted output
+        ESP_LOGI(TAG_NAU7802, "╔═══════════════ LOOP TIMING ═══════════════╗");
+        ESP_LOGI(TAG_NAU7802, "║ Ch A: Sel=%2lums Flush=%2lums Read=%2lums Conv=%2lums [%3lums] ║", 
+                 ch_a_select_time, ch_a_flush_time, ch_a_read_time, ch_a_convert_time, ch_a_total);
+        ESP_LOGI(TAG_NAU7802, "║ Ch B: Sel=%2lums Flush=%2lums Read=%2lums Conv=%2lums [%3lums] ║",
+                 ch_b_select_time, ch_b_flush_time, ch_b_read_time, ch_b_convert_time, ch_b_total);
+        ESP_LOGI(TAG_NAU7802, "║ Total: %3lums | Since last: %3lums            ║",
+                 total_loop_duration, time_since_last_iteration);
+        ESP_LOGI(TAG_NAU7802, "╚═══════════════════════════════════════════╝");
+        
+        // Update last loop end time for next iteration
+        last_loop_end_time = loop_end_time;
+#endif
 
         // Error counting and periodic logging for overall status
         if (!channel_a_connected && !channel_b_connected) {
@@ -637,7 +754,7 @@ static esp_err_t nau7802_flush_channel_buffer(nau7802_channel_t channel)
     
     // Discard 4 samples to flush the buffer
     // At 320 SPS, this takes ~12.5ms (4 samples * 3.125ms per sample)
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 1; i++) {
         ret = nau7802_wait_for_data_ready(250);  // 50ms timeout per sample at 80 SPS
         if (ret == ESP_OK) {
             int32_t dummy;
@@ -996,6 +1113,7 @@ esp_err_t nau7802_tare_channel(nau7802_channel_t channel)
     
     if (valid_samples < 5) {
         ESP_LOGE(TAG_NAU7802, "Insufficient stable readings for tare (%d/10)", valid_samples);
+        display_send_system_status("Scale Failed!", false, 2000);
         return ESP_ERR_TIMEOUT;
     }
     
@@ -1345,8 +1463,8 @@ static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibrati
     // Initialize Kalman filter if not done yet
     if (!ch_data->kf.initialized) {
         // Fast response parameters for coffee dosing application
-        float process_noise = 75.0f;       // High process noise for fast tracking of real weight changes
-        float measurement_noise = 1.5f;    // Trust measurements more (lower noise after moving average)
+        float process_noise = 150.0f;      // Very high process noise for very fast tracking of real weight changes
+        float measurement_noise = 1.0f;    // Trust measurements highly (lower noise after moving average)
         float dt = 0.025f;                 // 40 SPS = 25ms intervals
         
         nau7802_kalman_init(&ch_data->kf, process_noise, measurement_noise, dt);

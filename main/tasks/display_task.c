@@ -458,34 +458,34 @@ static void display_refresh_main_screen(void)
     // Update weight measurements with new error code handling
     // Container weight (Channel A)
     if (latest_container_weight == WEIGHT_DISPLAY_NO_CONN) {
-        snprintf(container_text, sizeof(container_text), "Cont: NO CONN");
+        snprintf(container_text, sizeof(container_text), "Cont: NO CONN ");
     } else if (latest_container_weight == WEIGHT_DISPLAY_TARING) {
-        snprintf(container_text, sizeof(container_text), "Cont:  ----g ");
+        snprintf(container_text, sizeof(container_text), "Cont:  ----g  ");
     } else if (latest_container_weight < 0) {
         // Any other negative value is an unknown error
-        snprintf(container_text, sizeof(container_text), "Cont: ERROR  ");
+        snprintf(container_text, sizeof(container_text), "Cont: ERROR   ");
     } else if (!weight_data_available) {
         // No weight data received yet - show actual value or 0
-        snprintf(container_text, sizeof(container_text), "Cont:%6.1fg", 0.0f);
+        snprintf(container_text, sizeof(container_text), "Cont: %5.1fg  ", 0.0f);
     } else {
         // Normal weight display with 0.1g precision
-        snprintf(container_text, sizeof(container_text), "Cont:%6.1fg", latest_container_weight);
+        snprintf(container_text, sizeof(container_text), "Cont: %5.1fg  ", latest_container_weight);
     }
     
     // Dosage weight (Channel B)
     if (latest_dosage_weight == WEIGHT_DISPLAY_NO_CONN) {
-        snprintf(dosage_text, sizeof(dosage_text), "Dose: NO CONN");
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: NO CONN ");
     } else if (latest_dosage_weight == WEIGHT_DISPLAY_TARING) {
-        snprintf(dosage_text, sizeof(dosage_text), "Dose:  ----g ");
+        snprintf(dosage_text, sizeof(dosage_text), "Dose:  ----g  ");
     } else if (latest_dosage_weight < 0) {
         // Any other negative value is an unknown error
-        snprintf(dosage_text, sizeof(dosage_text), "Dose: ERROR  ");
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: ERROR   ");
     } else if (!weight_data_available) {
         // No weight data received yet - show "------" for disabled channel
-        snprintf(dosage_text, sizeof(dosage_text), "Dose: ------");
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: ------  ");
     } else {
         // Normal weight display with 0.1g precision
-        snprintf(dosage_text, sizeof(dosage_text), "Dose:%6.1fg", latest_dosage_weight);
+        snprintf(dosage_text, sizeof(dosage_text), "Dose: %5.1fg  ", latest_dosage_weight);
     }
     
     ssd1306_display_text(&ssd1306_dev, 6, container_text, strlen(container_text), false);
