@@ -54,23 +54,26 @@
 #define PCA9685_MODE2_OUTNE0        0x01    // Output enable mode bit 0
 
 // PWM Constants
-#define PCA9685_PWM_FREQUENCY       1600    // Default PWM frequency in Hz (1.6kHz)
+#define PCA9685_PWM_FREQUENCY       1526    // Maximum PWM frequency in Hz (prescale=3)
 #define PCA9685_CLOCK_FREQ          25000000  // Internal oscillator frequency (25 MHz)
 #define PCA9685_PWM_RESOLUTION      4096    // 12-bit PWM resolution
 
+
+#define MOTOR_MIN_SPEED_PERCENT     10     
+
 // Motor Channel Definitions (per Adafruit Motor Shield V2 mapping)
-// DC Motors: M1, M2, M3 (auger), M4 (vacuum pump)
-#define MOTOR_M1_PWM                8       // Motor 1 PWM pin on PCA9685
+// DC Motors: M1 (air pump), M2 (auger motor), M3, M4
+#define MOTOR_M1_PWM                8       // Motor 1 PWM pin on PCA9685 (AIR PUMP)
 #define MOTOR_M1_IN2                9       // Motor 1 IN2 pin
 #define MOTOR_M1_IN1                10      // Motor 1 IN1 pin
-#define MOTOR_M2_PWM                13      // Motor 2 PWM pin
+#define MOTOR_M2_PWM                13      // Motor 2 PWM pin (AUGER MOTOR)
 #define MOTOR_M2_IN2                12      // Motor 2 IN2 pin
 #define MOTOR_M2_IN1                11      // Motor 2 IN1 pin
 
-#define MOTOR_M3_PWM                2       // Motor 3 PWM pin (auger motor)
+#define MOTOR_M3_PWM                2       // Motor 3 PWM pin (unused)
 #define MOTOR_M3_IN2                3       // Motor 3 IN2 pin
 #define MOTOR_M3_IN1                4       // Motor 3 IN1 pin
-#define MOTOR_M4_PWM                7       // Motor 4 PWM pin (vacuum pump)
+#define MOTOR_M4_PWM                7       // Motor 4 PWM pin (unused)
 #define MOTOR_M4_IN2                6       // Motor 4 IN2 pin
 #define MOTOR_M4_IN1                5       // Motor 4 IN1 pin
 
@@ -84,20 +87,21 @@ typedef enum {
     MOTOR_CMD_DISPENSE = 0,     // Start dispensing operation (from double-click)
     MOTOR_CMD_STOP,             // Stop current operation
     MOTOR_CMD_HOME,             // Reserved for future use
-    MOTOR_CMD_AIR_PUMP_ON,      // Turn on air pump
-    MOTOR_CMD_AIR_PUMP_OFF      // Turn off air pump
+    MOTOR_CMD_AIR_PUMP_SET,     // Set air pump speed (parameter = percent 0-100)
+    MOTOR_CMD_AUGER_SET         // Set auger motor speed (parameter = percent 0-100)
 } motor_command_type_t;
 
 // Motor command message structure
 typedef struct {
     motor_command_type_t command;
-    uint32_t parameter;         // Optional parameter (e.g., steps to move, weight target)
+    uint32_t parameter;         // Optional parameter (e.g., speed percent 0-100, weight target)
 } motor_command_t;
 
 // Motor state structure
 typedef struct {
     bool initialized;
-    bool air_pump_enabled;
+    uint16_t air_pump_speed;    // Current air pump PWM speed (0-4095)
+    uint16_t auger_speed;       // Current auger motor PWM speed (0-4095)
 } motor_state_t;
 
 /**
@@ -136,12 +140,20 @@ esp_err_t motor_get_state(motor_state_t* state);
 esp_err_t motor_set_pwm(uint8_t channel, uint16_t value);
 
 /**
- * @brief Control vacuum pump on M4 (on/off)
+ * @brief Control air pump on M1 with PWM speed control
  * 
- * @param enable true to turn on pump at full speed, false to turn off
+ * @param speed_percent Speed as percentage (0-100). 0 = off, 100 = full speed
  * @return ESP_OK on success, error code otherwise
  */
-esp_err_t motor_air_pump_control(bool enable);
+esp_err_t motor_air_pump_set_speed(uint8_t speed_percent);
+
+/**
+ * @brief Control auger motor on M2 with PWM speed control
+ * 
+ * @param speed_percent Speed as percentage (0-100). 0 = off, 100 = full speed
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t motor_auger_set_speed(uint8_t speed_percent);
 
 /**
  * @brief Send a command to the motor control task

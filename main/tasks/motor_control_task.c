@@ -86,7 +86,8 @@ esp_err_t motor_control_task_init(void)
     // Initialize motor state
     if (xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         motor_state.initialized = true;
-        motor_state.air_pump_enabled = false;
+        motor_state.air_pump_speed = 0;
+        motor_state.auger_speed = 0;
         xSemaphoreGive(motor_state_mutex);
     }
 
@@ -126,8 +127,9 @@ esp_err_t motor_control_task_deinit(void)
         motor_task_handle = NULL;
     }
 
-    // Turn off air pump
-    motor_air_pump_control(false);
+    // Turn off all motors
+    motor_air_pump_set_speed(0);
+    motor_auger_set_speed(0);
 
     // Delete command queue
     if (motor_command_queue != NULL) {
@@ -170,12 +172,13 @@ static void motor_task_function(void* pvParameters)
         
         // Periodic "hello" message every 5 seconds
         if (iteration % 50 == 0) {
-            ESP_LOGI(TAG_MOTOR, "Motor control task running - iteration %lu", iteration);
+            ESP_LOGD(TAG_MOTOR, "Motor control task running - iteration %lu", iteration);
             
             // Log current state
             motor_state_t state;
             if (motor_get_state(&state) == ESP_OK) {
-                ESP_LOGI(TAG_MOTOR, "State: air_pump=%d", state.air_pump_enabled);
+                ESP_LOGD(TAG_MOTOR, "State: air_pump_speed=%u, auger_speed=%u", 
+                         state.air_pump_speed, state.auger_speed);
             }
         }
         
@@ -195,7 +198,7 @@ static void motor_process_command(motor_command_t* cmd)
         case MOTOR_CMD_DISPENSE:
             ESP_LOGI(TAG_MOTOR, "========================================");
             ESP_LOGI(TAG_MOTOR, "DISPENSE command - parameter=%lu grams", cmd->parameter);
-            ESP_LOGI(TAG_MOTOR, "Using DC motor on M3 for auger");
+            ESP_LOGI(TAG_MOTOR, "Using DC motor on M2 for auger");
             
             // DC Motor Configuration
             const uint16_t auger_speed = 2048;  // 50% PWM (~0.05-0.1A)
@@ -203,13 +206,13 @@ static void motor_process_command(motor_command_t* cmd)
             
             // Ramp up
             ESP_LOGI(TAG_MOTOR, "Ramping up...");
-            motor_set_pwm(MOTOR_M3_IN1, 4095);  // Forward direction
-            motor_set_pwm(MOTOR_M3_IN2, 0);
+            motor_set_pwm(MOTOR_M2_IN1, 4095);  // Forward direction
+            motor_set_pwm(MOTOR_M2_IN2, 0);
             for (int s = 0; s <= auger_speed; s += 256) {
-                motor_set_pwm(MOTOR_M3_PWM, s);
+                motor_set_pwm(MOTOR_M2_PWM, s);
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
-            motor_set_pwm(MOTOR_M3_PWM, auger_speed);
+            motor_set_pwm(MOTOR_M2_PWM, auger_speed);
             
             // Run
             ESP_LOGI(TAG_MOTOR, "Dispensing...");
@@ -218,14 +221,14 @@ static void motor_process_command(motor_command_t* cmd)
             // Ramp down
             ESP_LOGI(TAG_MOTOR, "Ramping down...");
             for (int s = auger_speed; s >= 0; s -= 256) {
-                motor_set_pwm(MOTOR_M3_PWM, s);
+                motor_set_pwm(MOTOR_M2_PWM, s);
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             
             // Stop (coast mode: all pins low)
-            motor_set_pwm(MOTOR_M3_PWM, 0);
-            motor_set_pwm(MOTOR_M3_IN1, 0);
-            motor_set_pwm(MOTOR_M3_IN2, 0);
+            motor_set_pwm(MOTOR_M2_PWM, 0);
+            motor_set_pwm(MOTOR_M2_IN1, 0);
+            motor_set_pwm(MOTOR_M2_IN2, 0);
             
             ESP_LOGI(TAG_MOTOR, "Dispense complete");
             ESP_LOGI(TAG_MOTOR, "========================================");
@@ -233,12 +236,9 @@ static void motor_process_command(motor_command_t* cmd)
             
         case MOTOR_CMD_STOP:
             ESP_LOGI(TAG_MOTOR, "STOP command received - stopping all motors");
-            // Turn off M3 DC motor (auger) - coast mode
-            motor_set_pwm(MOTOR_M3_PWM, 0);
-            motor_set_pwm(MOTOR_M3_IN1, 0);
-            motor_set_pwm(MOTOR_M3_IN2, 0);
-            // Turn off air pump
-            motor_air_pump_control(false);
+            // Turn off all motors
+            motor_auger_set_speed(0);
+            motor_air_pump_set_speed(0);
             break;
             
         case MOTOR_CMD_HOME:
@@ -246,14 +246,14 @@ static void motor_process_command(motor_command_t* cmd)
             // Not applicable for DC motors
             break;
             
-        case MOTOR_CMD_AIR_PUMP_ON:
-            ESP_LOGI(TAG_MOTOR, "AIR_PUMP_ON command received");
-            motor_air_pump_control(true);
+        case MOTOR_CMD_AIR_PUMP_SET:
+            ESP_LOGI(TAG_MOTOR, "AIR_PUMP_SET command received - speed=%lu%%", cmd->parameter);
+            motor_air_pump_set_speed((uint8_t)(cmd->parameter & 0xFF));
             break;
             
-        case MOTOR_CMD_AIR_PUMP_OFF:
-            ESP_LOGI(TAG_MOTOR, "AIR_PUMP_OFF command received");
-            motor_air_pump_control(false);
+        case MOTOR_CMD_AUGER_SET:
+            ESP_LOGI(TAG_MOTOR, "AUGER_SET command received - speed=%lu%%", cmd->parameter);
+            motor_auger_set_speed((uint8_t)(cmd->parameter & 0xFF));
             break;
             
         default:
@@ -478,31 +478,98 @@ esp_err_t motor_set_pwm(uint8_t channel, uint16_t value)
     return pca9685_set_pwm(channel, 0, value);
 }
 
-esp_err_t motor_air_pump_control(bool enable)
+esp_err_t motor_air_pump_set_speed(uint8_t speed_percent)
 {
     if (!motor_task_running) {
         ESP_LOGE(TAG_MOTOR, "Motor control task not initialized");
         return ESP_ERR_INVALID_STATE;
     }
     
-    ESP_LOGI(TAG_MOTOR, "Vacuum pump (M4): %s", enable ? "ON" : "OFF");
+    // Clamp to 0-100 range
+    if (speed_percent > 100) {
+        speed_percent = 100;
+    }
     
-    // Use M4 for vacuum/air pump control
+    // Apply minimum speed threshold to overcome static friction
+    // If speed is between 1-MOTOR_MIN_SPEED_PERCENT, boost to minimum
+    uint8_t actual_speed = speed_percent;
+    if (speed_percent > 0 && speed_percent < MOTOR_MIN_SPEED_PERCENT) {
+        actual_speed = MOTOR_MIN_SPEED_PERCENT;
+        ESP_LOGD(TAG_MOTOR, "Air pump: Boosting %u%% to minimum %u%% for startup", 
+                 speed_percent, actual_speed);
+    }
+    
+    // Convert percentage to 12-bit PWM value (0-4095)
+    uint16_t pwm_value = (uint16_t)((actual_speed * 4095) / 100);
+    
+    ESP_LOGI(TAG_MOTOR, "Air pump (M1): %u%% requested, %u%% applied (PWM=%u)", 
+             speed_percent, actual_speed, pwm_value);
+    
+    // Use M1 for air pump control
     esp_err_t ret = ESP_OK;
-    if (enable) {
-        // Turn on M4 at full speed
-        motor_set_pwm(MOTOR_M4_IN1, 4095);  // Forward direction
-        motor_set_pwm(MOTOR_M4_IN2, 0);
-        ret = motor_set_pwm(MOTOR_M4_PWM, 4095);  // Full speed
+    if (pwm_value > 0) {
+        // Set direction to forward
+        motor_set_pwm(MOTOR_M1_IN1, 4095);
+        motor_set_pwm(MOTOR_M1_IN2, 0);
+        ret = motor_set_pwm(MOTOR_M1_PWM, pwm_value);
     } else {
-        // Turn off M4 (coast mode)
-        motor_set_pwm(MOTOR_M4_PWM, 0);
-        motor_set_pwm(MOTOR_M4_IN1, 0);
-        ret = motor_set_pwm(MOTOR_M4_IN2, 0);
+        // Turn off M1 (coast mode)
+        motor_set_pwm(MOTOR_M1_PWM, 0);
+        motor_set_pwm(MOTOR_M1_IN1, 0);
+        ret = motor_set_pwm(MOTOR_M1_IN2, 0);
     }
     
     if (ret == ESP_OK && xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        motor_state.air_pump_enabled = enable;
+        motor_state.air_pump_speed = pwm_value;
+        xSemaphoreGive(motor_state_mutex);
+    }
+    
+    return ret;
+}
+
+esp_err_t motor_auger_set_speed(uint8_t speed_percent)
+{
+    if (!motor_task_running) {
+        ESP_LOGE(TAG_MOTOR, "Motor control task not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // Clamp to 0-100 range
+    if (speed_percent > 100) {
+        speed_percent = 100;
+    }
+    
+    // Apply minimum speed threshold to overcome static friction
+    // If speed is between 1-MOTOR_MIN_SPEED_PERCENT, boost to minimum
+    uint8_t actual_speed = speed_percent;
+    if (speed_percent > 0 && speed_percent < MOTOR_MIN_SPEED_PERCENT) {
+        actual_speed = MOTOR_MIN_SPEED_PERCENT;
+        ESP_LOGD(TAG_MOTOR, "Auger motor: Boosting %u%% to minimum %u%% for startup", 
+                 speed_percent, actual_speed);
+    }
+    
+    // Convert percentage to 12-bit PWM value (0-4095)
+    uint16_t pwm_value = (uint16_t)((actual_speed * 4095) / 100);
+    
+    ESP_LOGI(TAG_MOTOR, "Auger motor (M2): %u%% requested, %u%% applied (PWM=%u)", 
+             speed_percent, actual_speed, pwm_value);
+    
+    // Use M2 for auger motor control
+    esp_err_t ret = ESP_OK;
+    if (pwm_value > 0) {
+        // Set direction to forward
+        motor_set_pwm(MOTOR_M2_IN1, 4095);
+        motor_set_pwm(MOTOR_M2_IN2, 0);
+        ret = motor_set_pwm(MOTOR_M2_PWM, pwm_value);
+    } else {
+        // Turn off M2 (coast mode)
+        motor_set_pwm(MOTOR_M2_PWM, 0);
+        motor_set_pwm(MOTOR_M2_IN1, 0);
+        ret = motor_set_pwm(MOTOR_M2_IN2, 0);
+    }
+    
+    if (ret == ESP_OK && xSemaphoreTake(motor_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        motor_state.auger_speed = pwm_value;
         xSemaphoreGive(motor_state_mutex);
     }
     

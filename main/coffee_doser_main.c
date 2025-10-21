@@ -24,6 +24,7 @@
 #include "display_task.h"
 #include "nau7802_task.h"
 #include "motor_control_task.h"
+#include "console_task.h"
 
 static void initialize_system(void)
 {
@@ -88,6 +89,13 @@ static void initialize_peripherals(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_MAIN, "Failed to initialize motor control task: %s", esp_err_to_name(ret));
         return;
+    }
+    
+    // Initialize console task for development/debugging
+    ret = console_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "Failed to initialize console task: %s", esp_err_to_name(ret));
+        // Non-fatal, continue without console
     }
     
     ESP_LOGI(TAG_MAIN, "Peripheral initialization complete");

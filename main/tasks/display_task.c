@@ -108,8 +108,8 @@ esp_err_t display_task_init(void)
     // Clear display and show initial encoder display layout
     ssd1306_clear_screen(&ssd1306_dev, false);
 
-    // Draw Baba Java (Baba Yaga Coffee Doser) Startup Logo
-    ssd1306_display_text(&ssd1306_dev, 0, "   BABA JAVA", 13, false);
+    // Draw Java Yaga (Baba Yaga Coffee Doser) Startup Logo
+    ssd1306_display_text(&ssd1306_dev, 0, "   JAVA YAGA", 13, false);
     ssd1306_display_text(&ssd1306_dev, 1, " _____________", 14, false);
     ssd1306_display_text(&ssd1306_dev, 2, "|_____===_____|", 15, false);
     ssd1306_display_text(&ssd1306_dev, 3, "| .-. |~| .-. |", 15, false);

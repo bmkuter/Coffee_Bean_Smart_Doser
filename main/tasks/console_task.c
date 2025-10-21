@@ -1,0 +1,448 @@
+/*
+ * Console Task - USB UART Command Interface
+ * 
+ * Provides interactive serial console for development and testing
+ */
+
+#include "console_task.h"
+#include "motor_control_task.h"
+#include "nau7802_task.h"
+#include "rotary_encoder_task.h"
+#include "display_task.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <stdarg.h>
+
+// UART Configuration
+#define CONSOLE_UART_PORT           UART_NUM_1  // Use UART1 (separate from logging)
+#define CONSOLE_UART_BAUD_RATE      115200
+#define CONSOLE_UART_TX_PIN         16          // GPIO 16 for TX
+#define CONSOLE_UART_RX_PIN         17          // GPIO 17 for RX
+
+// Task variables
+static TaskHandle_t console_task_handle = NULL;
+static bool console_task_running = false;
+
+// Command buffer
+static char rx_buffer[CONSOLE_RX_BUFFER_SIZE];
+static int rx_index = 0;
+
+// Forward declarations
+static void console_task_function(void* pvParameters);
+static void console_process_command(char *cmd_line);
+static void console_parse_and_execute(char *cmd_line);
+static void console_printf(const char *format, ...);  // Printf to console UART
+
+// Built-in command handlers
+static void cmd_help(int argc, char **argv);
+static void cmd_motor_air(int argc, char **argv);
+static void cmd_motor_auger(int argc, char **argv);
+static void cmd_motor_stop(int argc, char **argv);
+static void cmd_tare(int argc, char **argv);
+static void cmd_calibrate(int argc, char **argv);
+static void cmd_weight(int argc, char **argv);
+static void cmd_status(int argc, char **argv);
+static void cmd_encoder(int argc, char **argv);
+
+// Built-in commands
+static const console_command_t builtin_commands[] = {
+    {"help", "Show this help message", cmd_help},
+    {"?", "Show this help message", cmd_help},
+    {"air", "air <speed>  - Set air pump speed (0-100%)", cmd_motor_air},
+    {"auger", "auger <speed>  - Set auger motor speed (0-100%)", cmd_motor_auger},
+    {"stop", "Stop all motors", cmd_motor_stop},
+    {"tare", "Tare both weight channels", cmd_tare},
+    {"cal", "cal <weight>  - Calibrate with known weight (grams)", cmd_calibrate},
+    {"weight", "Show current weight readings", cmd_weight},
+    {"status", "Show system status", cmd_status},
+    {"encoder", "encoder <position>  - Set encoder position", cmd_encoder},
+};
+
+#define NUM_BUILTIN_COMMANDS (sizeof(builtin_commands) / sizeof(console_command_t))
+
+// Helper function to print to console UART
+static void console_printf(const char *format, ...)
+{
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    
+    if (len > 0) {
+        uart_write_bytes(CONSOLE_UART_PORT, buffer, len);
+    }
+}
+
+// Public API Functions
+esp_err_t console_task_init(void)
+{
+    if (console_task_running) {
+        ESP_LOGW(TAG_CONSOLE, "Console task already running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Configure UART parameters
+    uart_config_t uart_config = {
+        .baud_rate = CONSOLE_UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    // Install UART driver using an event queue
+    esp_err_t ret = uart_driver_install(CONSOLE_UART_PORT, 
+                                        CONSOLE_RX_BUFFER_SIZE * 2, 
+                                        0,  // No TX buffer
+                                        0,  // No event queue
+                                        NULL, 
+                                        0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_CONSOLE, "Failed to install UART driver: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = uart_param_config(CONSOLE_UART_PORT, &uart_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_CONSOLE, "Failed to configure UART: %s", esp_err_to_name(ret));
+        uart_driver_delete(CONSOLE_UART_PORT);
+        return ret;
+    }
+
+    ret = uart_set_pin(CONSOLE_UART_PORT, CONSOLE_UART_TX_PIN, CONSOLE_UART_RX_PIN, 
+                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_CONSOLE, "Failed to set UART pins: %s", esp_err_to_name(ret));
+        uart_driver_delete(CONSOLE_UART_PORT);
+        return ret;
+    }
+
+    // Create console task
+    BaseType_t task_created = xTaskCreatePinnedToCore(
+        console_task_function,
+        "console_task",
+        CONSOLE_TASK_STACK_SIZE,
+        NULL,
+        CONSOLE_TASK_PRIORITY,
+        &console_task_handle,
+        CONSOLE_TASK_CORE
+    );
+
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG_CONSOLE, "Failed to create console task");
+        uart_driver_delete(CONSOLE_UART_PORT);
+        return ESP_FAIL;
+    }
+
+    console_task_running = true;
+    ESP_LOGI(TAG_CONSOLE, "Console task initialized successfully on UART%d @ %d baud", 
+             CONSOLE_UART_PORT, CONSOLE_UART_BAUD_RATE);
+    ESP_LOGI(TAG_CONSOLE, "Console TX: GPIO%d, RX: GPIO%d", CONSOLE_UART_TX_PIN, CONSOLE_UART_RX_PIN);
+    
+    // Print welcome message to UART1 console
+    console_printf("\r\n\r\n");
+    console_printf("========================================\r\n");
+    console_printf("  Coffee Bean Smart Doser Console\r\n");
+    console_printf("  UART1: GPIO16(TX) / GPIO17(RX)\r\n");
+    console_printf("========================================\r\n");
+    console_printf("Type 'help' for available commands\r\n\r\n");
+    console_printf("> ");
+    
+    return ESP_OK;
+}
+
+esp_err_t console_task_deinit(void)
+{
+    if (!console_task_running) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG_CONSOLE, "Deinitializing console task");
+
+    // Delete task
+    if (console_task_handle != NULL) {
+        vTaskDelete(console_task_handle);
+        console_task_handle = NULL;
+    }
+
+    // Delete UART driver
+    uart_driver_delete(CONSOLE_UART_PORT);
+
+    console_task_running = false;
+    return ESP_OK;
+}
+
+// Task function
+static void console_task_function(void* pvParameters)
+{
+    uint8_t data;
+    
+    while (1) {
+        // Read one byte at a time
+        int len = uart_read_bytes(CONSOLE_UART_PORT, &data, 1, pdMS_TO_TICKS(100));
+        
+        if (len > 0) {
+            // Echo character
+            uart_write_bytes(CONSOLE_UART_PORT, (const char*)&data, 1);
+            
+            // Handle backspace
+            if (data == '\b' || data == 127) {
+                if (rx_index > 0) {
+                    rx_index--;
+                    console_printf("\b \b");  // Erase character on screen
+                }
+                continue;
+            }
+            
+            // Handle newline/carriage return
+            if (data == '\n' || data == '\r') {
+                console_printf("\r\n");
+                
+                if (rx_index > 0) {
+                    rx_buffer[rx_index] = '\0';
+                    console_process_command(rx_buffer);
+                    rx_index = 0;
+                }
+                
+                console_printf("> ");
+                continue;
+            }
+            
+            // Add to buffer if printable and space available
+            if (isprint(data) && rx_index < CONSOLE_RX_BUFFER_SIZE - 1) {
+                rx_buffer[rx_index++] = data;
+            }
+        }
+        
+        // Small delay to prevent CPU hogging
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// Process received command
+static void console_process_command(char *cmd_line)
+{
+    // Trim leading whitespace
+    while (*cmd_line && isspace((unsigned char)*cmd_line)) {
+        cmd_line++;
+    }
+    
+    // Ignore empty commands
+    if (*cmd_line == '\0') {
+        return;
+    }
+    
+    // Trim trailing whitespace
+    char *end = cmd_line + strlen(cmd_line) - 1;
+    while (end > cmd_line && isspace((unsigned char)*end)) {
+        *end-- = '\0';
+    }
+    
+    console_parse_and_execute(cmd_line);
+}
+
+// Parse and execute command
+static void console_parse_and_execute(char *cmd_line)
+{
+    char *argv[CONSOLE_CMD_MAX_ARGS];
+    int argc = 0;
+    
+    // Tokenize command line
+    char *token = strtok(cmd_line, " \t");
+    while (token != NULL && argc < CONSOLE_CMD_MAX_ARGS) {
+        argv[argc++] = token;
+        token = strtok(NULL, " \t");
+    }
+    
+    if (argc == 0) {
+        return;
+    }
+    
+    // Find and execute command
+    for (int i = 0; i < NUM_BUILTIN_COMMANDS; i++) {
+        if (strcasecmp(argv[0], builtin_commands[i].command) == 0) {
+            builtin_commands[i].handler(argc, argv);
+            return;
+        }
+    }
+    
+    console_printf("Unknown command: %s\r\n", argv[0]);
+    console_printf("Type 'help' for available commands\r\n");
+}
+
+// Built-in command handlers
+static void cmd_help(int argc, char **argv)
+{
+    console_printf("\r\nAvailable commands:\r\n");
+    console_printf("------------------\r\n");
+    for (int i = 0; i < NUM_BUILTIN_COMMANDS; i++) {
+        console_printf("  %-12s - %s\r\n", builtin_commands[i].command, builtin_commands[i].help);
+    }
+    console_printf("\r\n");
+}
+
+static void cmd_motor_air(int argc, char **argv)
+{
+    if (argc < 2) {
+        console_printf("Usage: air <speed>\r\n");
+        console_printf("  speed: 0-100 (percent, 0=off, 100=full speed)\r\n");
+        return;
+    }
+    
+    int speed = atoi(argv[1]);
+    if (speed < 0 || speed > 100) {
+        console_printf("Error: Speed must be 0-100%%\r\n");
+        return;
+    }
+    
+    esp_err_t ret = motor_air_pump_set_speed((uint8_t)speed);
+    if (ret == ESP_OK) {
+        console_printf("Air pump set to %d%%\r\n", speed);
+    } else {
+        console_printf("Error setting air pump speed: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_motor_auger(int argc, char **argv)
+{
+    if (argc < 2) {
+        console_printf("Usage: auger <speed>\r\n");
+        console_printf("  speed: 0-100 (percent, 0=off, 100=full speed)\r\n");
+        return;
+    }
+    
+    int speed = atoi(argv[1]);
+    if (speed < 0 || speed > 100) {
+        console_printf("Error: Speed must be 0-100%%\r\n");
+        return;
+    }
+    
+    esp_err_t ret = motor_auger_set_speed((uint8_t)speed);
+    if (ret == ESP_OK) {
+        console_printf("Auger motor set to %d%%\r\n", speed);
+    } else {
+        console_printf("Error setting auger speed: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_motor_stop(int argc, char **argv)
+{
+    motor_air_pump_set_speed(0);
+    motor_auger_set_speed(0);
+    console_printf("All motors stopped\r\n");
+}
+
+static void cmd_tare(int argc, char **argv)
+{
+    console_printf("Taring both channels...\r\n");
+    esp_err_t ret = nau7802_tare_channel(NAU7802_CHANNEL_1);
+    if (ret == ESP_OK) {
+        console_printf("Channel A tared successfully\r\n");
+    } else {
+        console_printf("Channel A tare failed: %s\r\n", esp_err_to_name(ret));
+    }
+    
+    ret = nau7802_tare_channel(NAU7802_CHANNEL_2);
+    if (ret == ESP_OK) {
+        console_printf("Channel B tared successfully\r\n");
+    } else {
+        console_printf("Channel B tare failed: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_calibrate(int argc, char **argv)
+{
+    if (argc < 2) {
+        console_printf("Usage: cal <weight>\r\n");
+        console_printf("  weight: Known calibration weight in grams\r\n");
+        return;
+    }
+    
+    float weight = atof(argv[1]);
+    if (weight <= 0.0f) {
+        console_printf("Error: Weight must be greater than 0\r\n");
+        return;
+    }
+    
+    console_printf("Calibrating with %.1fg weight...\r\n", weight);
+    console_printf("Make sure weight is on Channel A\r\n");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_1, weight);
+    if (ret == ESP_OK) {
+        console_printf("Channel A calibration successful\r\n");
+    } else {
+        console_printf("Channel A calibration failed: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_weight(int argc, char **argv)
+{
+    nau7802_data_t data;
+    esp_err_t ret = nau7802_get_data(&data);
+    
+    if (ret == ESP_OK) {
+        console_printf("\r\nWeight Readings:\r\n");
+        console_printf("  Channel A: %7.1f g (raw: %8ld)\r\n", 
+               data.channel_a.filtered_weight, data.channel_a.raw_value);
+        console_printf("  Channel B: %7.1f g (raw: %8ld)\r\n", 
+               data.channel_b.filtered_weight, data.channel_b.raw_value);
+        console_printf("\r\n");
+    } else {
+        console_printf("Error reading weight data: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_status(int argc, char **argv)
+{
+    motor_state_t motor_state;
+    nau7802_data_t weight_data;
+    
+    console_printf("\r\n========== System Status ==========\r\n");
+    
+    // Motor status
+    if (motor_get_state(&motor_state) == ESP_OK) {
+        console_printf("Motors:\r\n");
+        console_printf("  Air pump:  %4u (%.1f%%)\r\n", 
+               motor_state.air_pump_speed, 
+               (motor_state.air_pump_speed * 100.0f) / 4095.0f);
+        console_printf("  Auger:     %4u (%.1f%%)\r\n", 
+               motor_state.auger_speed, 
+               (motor_state.auger_speed * 100.0f) / 4095.0f);
+    }
+    
+    // Weight status
+    if (nau7802_get_data(&weight_data) == ESP_OK) {
+        console_printf("\r\nWeight:\r\n");
+        console_printf("  Channel A: %7.1f g\r\n", weight_data.channel_a.filtered_weight);
+        console_printf("  Channel B: %7.1f g\r\n", weight_data.channel_b.filtered_weight);
+    }
+    
+    console_printf("===================================\r\n\r\n");
+}
+
+static void cmd_encoder(int argc, char **argv)
+{
+    if (argc < 2) {
+        console_printf("Usage: encoder <position>\r\n");
+        console_printf("  position: New encoder position value\r\n");
+        return;
+    }
+    
+    int32_t position = atoi(argv[1]);
+    
+    esp_err_t ret = rotary_encoder_set_position(position);
+    if (ret == ESP_OK) {
+        console_printf("Encoder position set to %ld\r\n", position);
+    } else {
+        console_printf("Error setting encoder position: %s\r\n", esp_err_to_name(ret));
+    }
+}

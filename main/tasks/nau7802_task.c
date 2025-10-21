@@ -29,6 +29,8 @@
 #define NVS_NAMESPACE "nau7802"
 #define NVS_KEY_TARE_A "tare_a"
 #define NVS_KEY_TARE_B "tare_b"
+#define NVS_KEY_SCALE_A "scale_a"
+#define NVS_KEY_SCALE_B "scale_b"
 
 // Task variables
 static TaskHandle_t nau7802_task_handle = NULL;
@@ -78,6 +80,8 @@ static void nau7802_calibrate_timing(int num_samples);
 static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position, int32_t delta);
 static esp_err_t nau7802_save_tare_values(void);
 static esp_err_t nau7802_load_tare_values(void);
+static esp_err_t nau7802_save_calibration_values(void);
+static esp_err_t nau7802_load_calibration_values(void);
 static esp_err_t nau7802_init_nvs(void);
 static float nau7802_raw_to_weight_filtered(int32_t raw_value, nau7802_calibration_t* cal, nau7802_channel_data_t* ch_data, uint32_t timestamp_ms, const char* channel_name);
 
@@ -123,6 +127,14 @@ esp_err_t nau7802_task_init(void)
             ESP_LOGI(TAG_NAU7802, "Restored tare values from flash storage");
         } else {
             ESP_LOGW(TAG_NAU7802, "Using default tare values (no saved values found)");
+        }
+        
+        // Load saved calibration values from flash
+        ret = nau7802_load_calibration_values();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG_NAU7802, "Restored calibration values from flash storage");
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Using default calibration values (no saved values found)");
         }
     }
 
@@ -934,11 +946,23 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
     } else if (event == ROTARY_EVENT_LONG_PRESS) {
         // Long press - Calibrate with 358.2g weight
         ESP_LOGI(TAG_NAU7802, "Long press detected - starting calibration with 358.2g weight");
-        
+        display_send_system_status("358.2g -> Ch A", false, 2000);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
         // Calibrate Channel A (Container)
         if (channel_a_connected) {
-            display_send_system_status("Ch A: 358.2g", false, 0);  // Indefinite
-            vTaskDelay(pdMS_TO_TICKS(2000));  // Give user time to read
+            // Show instruction to move weight and press button when ready
+            display_send_system_status("Move to Ch A - 5", false, 1000); 
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Move to Ch A - 4", false, 1000); 
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Move to Ch A - 3", false, 1000); 
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Move to Ch A - 2", false, 1000);
+            vTaskDelay(pdMS_TO_TICKS(1000));    
+            display_send_system_status("Move to Ch A - 1", false, 1000);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Cal Ch A...", false, 0);  // Indefinite
             
             esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_1, 358.2f);
             if (ret == ESP_OK) {
@@ -951,34 +975,18 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         // Calibrate Channel B if connected - wait for user confirmation
         if (channel_b_connected) {
             // Show instruction to move weight and press button when ready
-            display_send_system_status("Move to Ch B", false, 3000);  // Indefinite
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            display_send_system_status("Press when OK", false, 0);  // Indefinite
-            
-            // Wait for button press confirmation
-            ESP_LOGI(TAG_NAU7802, "Waiting for button press to calibrate Channel B...");
-            
-            // Simple blocking wait for button press (check button state every 100ms)
-            bool button_pressed = false;
-            while (!button_pressed) {
-                rotary_encoder_data_t rotary_data;
-                if (rotary_encoder_get_data(&rotary_data) == ESP_OK) {
-                    if (rotary_data.button_pressed) {
-                        button_pressed = true;
-                        ESP_LOGI(TAG_NAU7802, "Button press detected - proceeding with Channel B calibration");
-                        
-                        // Wait for button release
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        while (rotary_data.button_pressed) {
-                            vTaskDelay(pdMS_TO_TICKS(50));
-                            rotary_encoder_get_data(&rotary_data);
-                        }
-                        break;
-                    }
-                }
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            
+            display_send_system_status("Move to Ch B - 5", false, 1000); 
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Move to Ch B - 4", false, 1000); 
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Move to Ch B - 3", false, 1000); 
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Move to Ch B - 2", false, 1000);
+            vTaskDelay(pdMS_TO_TICKS(1000));    
+            display_send_system_status("Move to Ch B - 1", false, 1000);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            display_send_system_status("Cal Ch B...", false, 0);  // Indefinite
+
             // Now calibrate Channel B
             esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_2, 358.2f);
             if (ret == ESP_OK) {
@@ -1088,6 +1096,94 @@ static esp_err_t nau7802_load_tare_values(void)
         channel_b_cal.zero_offset = 0;
     } else {
         ESP_LOGI(TAG_NAU7802, "Loaded Channel B tare value: %ld", channel_b_cal.zero_offset);
+    }
+
+    nvs_close(nvs_handle);
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_save_calibration_values(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret;
+
+    ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to open NVS handle: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Save Channel A scale factor (as float blob)
+    ret = nvs_set_blob(nvs_handle, NVS_KEY_SCALE_A, &channel_a_cal.scale_factor, sizeof(float));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to save Channel A scale factor: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
+    // Save Channel B scale factor (as float blob)
+    ret = nvs_set_blob(nvs_handle, NVS_KEY_SCALE_B, &channel_b_cal.scale_factor, sizeof(float));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to save Channel B scale factor: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
+    // Commit changes
+    ret = nvs_commit(nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to commit NVS changes: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG_NAU7802, "Calibration values saved - Channel A: %.4f, Channel B: %.4f", 
+             channel_a_cal.scale_factor, channel_b_cal.scale_factor);
+    return ESP_OK;
+}
+
+static esp_err_t nau7802_load_calibration_values(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret;
+
+    ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to open NVS handle for reading: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Load Channel A scale factor
+    size_t required_size = sizeof(float);
+    ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_A, &channel_a_cal.scale_factor, &required_size);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG_NAU7802, "No saved Channel A scale factor found, using default (10.44)");
+        channel_a_cal.scale_factor = 10.44f;
+        channel_a_cal.is_calibrated = false;
+    } else if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to load Channel A scale factor: %s", esp_err_to_name(ret));
+        channel_a_cal.scale_factor = 10.44f;
+        channel_a_cal.is_calibrated = false;
+    } else {
+        channel_a_cal.is_calibrated = true;
+        ESP_LOGI(TAG_NAU7802, "Loaded Channel A scale factor: %.4f", channel_a_cal.scale_factor);
+    }
+
+    // Load Channel B scale factor
+    required_size = sizeof(float);
+    ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_B, &channel_b_cal.scale_factor, &required_size);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG_NAU7802, "No saved Channel B scale factor found, using default (10.44)");
+        channel_b_cal.scale_factor = 10.44f;
+        channel_b_cal.is_calibrated = false;
+    } else if (ret != ESP_OK) {
+        ESP_LOGW(TAG_NAU7802, "Failed to load Channel B scale factor: %s", esp_err_to_name(ret));
+        channel_b_cal.scale_factor = 10.44f;
+        channel_b_cal.is_calibrated = false;
+    } else {
+        channel_b_cal.is_calibrated = true;
+        ESP_LOGI(TAG_NAU7802, "Loaded Channel B scale factor: %.4f", channel_b_cal.scale_factor);
     }
 
     nvs_close(nvs_handle);
@@ -1276,7 +1372,7 @@ esp_err_t nau7802_calibrate_channel(nau7802_channel_t channel, float known_weigh
                 if (ret == ESP_OK) {
                     cal_samples[valid_samples] = raw_value;
                     valid_samples++;
-                    ESP_LOGD(TAG_NAU7802, "Cal sample %d: %ld", valid_samples, raw_value);
+                    ESP_LOGI(TAG_NAU7802, "Cal sample %d: %ld", valid_samples, raw_value);
                 }
             }
         }
@@ -1302,13 +1398,6 @@ esp_err_t nau7802_calibrate_channel(nau7802_channel_t channel, float known_weigh
     // scale_factor = (raw_value - zero_offset) / known_weight
     int32_t reading_above_tare = averaged_reading - cal->zero_offset;
     
-    if (reading_above_tare <= 0) {
-        ESP_LOGE(TAG_NAU7802, "Invalid calibration: reading (%ld) not above tare (%ld)", 
-                 averaged_reading, cal->zero_offset);
-        display_send_system_status("Cal Error!", true, 2000);
-        return ESP_ERR_INVALID_STATE;
-    }
-    
     float new_scale_factor = (float)reading_above_tare / known_weight_grams;
     
     ESP_LOGI(TAG_NAU7802, "New scale factor: %.4f (was %.4f)", new_scale_factor, cal->scale_factor);
@@ -1319,6 +1408,14 @@ esp_err_t nau7802_calibrate_channel(nau7802_channel_t channel, float known_weigh
         cal->scale_factor = new_scale_factor;
         cal->is_calibrated = true;
         xSemaphoreGive(nau7802_data_mutex);
+        
+        // Save calibration values to NVS for persistence across reboots
+        esp_err_t save_ret = nau7802_save_calibration_values();
+        if (save_ret == ESP_OK) {
+            ESP_LOGI(TAG_NAU7802, "Calibration values saved to flash storage");
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to save calibration values to flash: %s", esp_err_to_name(save_ret));
+        }
         
         // Show success message
         display_send_system_status("Cal Success!", false, 2000);
