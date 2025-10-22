@@ -6,8 +6,17 @@
  */
 
 #include "motor_control_task.h"
-#include "pca9685_driver.h"
 #include "coffee_doser_config.h"
+
+// Include hardware-specific driver based on configuration
+#ifdef USE_PCA9685_MOTOR_DRIVER
+    #include "pca9685_driver.h"
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+    #include "tb6612_driver.h"
+#else
+    #error "No motor driver selected! Define USE_PCA9685_MOTOR_DRIVER or USE_TB6612_MOTOR_DRIVER in coffee_doser_config.h"
+#endif
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -39,8 +48,16 @@ esp_err_t motor_control_task_init(void)
 
     ESP_LOGI(TAG_MOTOR, "Initializing motor control task");
 
-    // Initialize PWM hardware driver (PCA9685)
-    esp_err_t ret = pca9685_init();
+    // Initialize PWM hardware driver based on configuration
+    esp_err_t ret;
+#ifdef USE_PCA9685_MOTOR_DRIVER
+    ESP_LOGI(TAG_MOTOR, "Using PCA9685 I2C PWM controller");
+    ret = pca9685_init();
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+    ESP_LOGI(TAG_MOTOR, "Using TB6612FNG dual H-bridge controller (Pololu #713)");
+    ret = tb6612_init();
+#endif
+    
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_MOTOR, "Failed to initialize PWM hardware: %s", esp_err_to_name(ret));
         return ret;
@@ -50,7 +67,11 @@ esp_err_t motor_control_task_init(void)
     motor_state_mutex = xSemaphoreCreateMutex();
     if (motor_state_mutex == NULL) {
         ESP_LOGE(TAG_MOTOR, "Failed to create motor state mutex");
+#ifdef USE_PCA9685_MOTOR_DRIVER
         pca9685_deinit();
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+        tb6612_deinit();
+#endif
         return ESP_ERR_NO_MEM;
     }
 
@@ -59,7 +80,11 @@ esp_err_t motor_control_task_init(void)
     if (motor_command_queue == NULL) {
         ESP_LOGE(TAG_MOTOR, "Failed to create motor command queue");
         vSemaphoreDelete(motor_state_mutex);
+#ifdef USE_PCA9685_MOTOR_DRIVER
         pca9685_deinit();
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+        tb6612_deinit();
+#endif
         return ESP_ERR_NO_MEM;
     }
 
@@ -86,7 +111,11 @@ esp_err_t motor_control_task_init(void)
         ESP_LOGE(TAG_MOTOR, "Failed to create motor control task");
         vSemaphoreDelete(motor_state_mutex);
         vQueueDelete(motor_command_queue);
+#ifdef USE_PCA9685_MOTOR_DRIVER
         pca9685_deinit();
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+        tb6612_deinit();
+#endif
         return ESP_FAIL;
     }
 
@@ -126,7 +155,11 @@ esp_err_t motor_control_task_deinit(void)
     }
 
     // Deinitialize PWM hardware
+#ifdef USE_PCA9685_MOTOR_DRIVER
     pca9685_deinit();
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+    tb6612_deinit();
+#endif
 
     motor_task_running = false;
     ESP_LOGI(TAG_MOTOR, "Motor control task deinitialized");
@@ -263,8 +296,15 @@ esp_err_t motor_set_pwm(uint8_t channel, uint16_t value)
         return ESP_ERR_INVALID_STATE;
     }
     
-    // Use hardware abstraction layer
+    // Use hardware abstraction layer based on configuration
+#ifdef USE_PCA9685_MOTOR_DRIVER
     return pca9685_set_pwm_value(channel, value);
+#elif defined(USE_TB6612_MOTOR_DRIVER)
+    return tb6612_set_pwm_value(channel, value);
+#else
+    ESP_LOGE(TAG_MOTOR, "No motor driver configured!");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 esp_err_t motor_air_pump_set_speed(uint8_t speed_percent)

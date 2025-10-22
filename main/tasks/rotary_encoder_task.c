@@ -201,7 +201,7 @@ static void rotary_encoder_task(void* pvParameters)
     
     // Long press detection for reset functionality
     TickType_t button_press_start = 0;
-    const TickType_t long_press_duration = pdMS_TO_TICKS(1250);  // 1250ms long press
+    const TickType_t long_press_duration = pdMS_TO_TICKS(750);  // 750ms long press
     bool long_press_triggered = false;
     bool showing_long_press_feedback = false;
     

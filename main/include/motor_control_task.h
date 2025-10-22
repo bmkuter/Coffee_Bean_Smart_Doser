@@ -17,7 +17,7 @@
 #define TAG_MOTOR "MOTOR_CTRL"
 
 // Motor Performance Parameters
-#define MOTOR_MIN_SPEED_PERCENT     10      // Minimum speed to overcome static friction
+#define MOTOR_MIN_SPEED_PERCENT     1      // Minimum speed to overcome static friction
 
 // Motor Assignment Macros (for readability)
 #define MOTOR_AUGER_PWM             MOTOR_M1_PWM

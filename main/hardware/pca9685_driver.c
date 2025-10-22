@@ -3,11 +3,16 @@
  * 
  * Low-level driver for PCA9685 16-channel 12-bit PWM controller
  * Communicates via I2C bus
+ * 
+ * Only compiled when USE_PCA9685_MOTOR_DRIVER is defined in coffee_doser_config.h
  */
+
+#include "coffee_doser_config.h"
+
+#ifdef USE_PCA9685_MOTOR_DRIVER
 
 #include "pca9685_driver.h"
 #include "shared_i2c_bus.h"
-#include "coffee_doser_config.h"
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -252,3 +257,5 @@ esp_err_t pca9685_all_off(void)
     
     return ret;
 }
+
+#endif // USE_PCA9685_MOTOR_DRIVER

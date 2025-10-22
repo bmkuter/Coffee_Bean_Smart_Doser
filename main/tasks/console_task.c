@@ -371,17 +371,57 @@ static void cmd_calibrate(int argc, char **argv)
         console_printf("Error: Weight must be greater than 0\r\n");
         return;
     }
-    
-    console_printf("Calibrating with %.1fg weight...\r\n", weight);
-    console_printf("Make sure weight is on Channel A\r\n");
+    ESP_LOGI(TAG_NAU7802, "Long press detected - starting calibration with 358.2g weight");
+    display_send_system_status("358.2g -> Ch A", false, 2000);
     vTaskDelay(pdMS_TO_TICKS(2000));
+
+// Calibrate Channel A (Container)
+    // Show instruction to move weight and press button when ready
+    display_send_system_status("Move to Ch A - 5", false, 1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Move to Ch A - 4", false, 1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Move to Ch A - 3", false, 1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Move to Ch A - 2", false, 1000);
+    vTaskDelay(pdMS_TO_TICKS(1000));    
+    display_send_system_status("Move to Ch A - 1", false, 1000);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Cal Ch A...", false, 0);  // Indefinite
     
-    esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_1, weight);
+    esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_1, 358.2f);
     if (ret == ESP_OK) {
-        console_printf("Channel A calibration successful\r\n");
+        ESP_LOGI(TAG_NAU7802, "Channel A calibrated with 358.2g weight");
     } else {
-        console_printf("Channel A calibration failed: %s\r\n", esp_err_to_name(ret));
+        ESP_LOGW(TAG_NAU7802, "Failed to calibrate Channel A: %s", esp_err_to_name(ret));
     }
+    
+// Calibrate Channel B if connected - wait for user confirmation
+    // Show instruction to move weight and press button when ready
+    display_send_system_status("Move to Ch B - 5", false, 1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Move to Ch B - 4", false, 1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Move to Ch B - 3", false, 1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Move to Ch B - 2", false, 1000);
+    vTaskDelay(pdMS_TO_TICKS(1000));    
+    display_send_system_status("Move to Ch B - 1", false, 1000);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_send_system_status("Cal Ch B...", false, 0);  // Indefinite
+
+    // Now calibrate Channel B
+    ret = nau7802_calibrate_channel(NAU7802_CHANNEL_2, 358.2f);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG_NAU7802, "Channel B calibrated with 358.2g weight");
+    } else {
+        ESP_LOGW(TAG_NAU7802, "Failed to calibrate Channel B: %s", esp_err_to_name(ret));
+    }
+
+    // Show completion message
+    display_send_system_status("Cal Complete!", false, 2000);
+    ESP_LOGI(TAG_NAU7802, "Calibration sequence complete");
+        
 }
 
 static void cmd_weight(int argc, char **argv)

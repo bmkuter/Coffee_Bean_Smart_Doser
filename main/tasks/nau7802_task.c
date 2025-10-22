@@ -48,11 +48,18 @@ static uint32_t channel_b_consecutive_errors = 0;
 // Tare operation tracking
 static volatile bool tare_in_progress = false;  // Flag to indicate tare operation in progress
 
+// Dosing motor control
+static bool dosing_active = false;              // Track if we're currently dosing
+static TickType_t dosing_start_time = 0;        // When dosing started
+#define DOSING_RAMP_DURATION_MS  250            // Ramp from 5% to 3% over 1 second
+#define DOSING_START_SPEED       5               // Start at 5% (reliable startup)
+#define DOSING_TARGET_SPEED      3               // Target 3% (minimum steady speed)
+
 // I2C device handle
 static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
 
 // Calibration data for both channels  
-static nau7802_calibration_t channel_a_cal = {0, 10.44f, false};  // Corrected based on 358g weight test
+static nau7802_calibration_t channel_a_cal = {0, -10.44f, false};  // Corrected based on 358g weight test
 static nau7802_calibration_t channel_b_cal = {0, 10.44f, false};  // Corrected based on 358g weight test
 
 // Configuration
@@ -492,6 +499,27 @@ static void nau7802_task_function(void* pvParameters)
             }
         }
 
+        // ==================== Dosing Motor Ramp-Down ====================
+        // If dosing is active, gradually ramp speed from 5% to 3%
+        if (dosing_active) {
+            TickType_t current_ticks = xTaskGetTickCount();
+            uint32_t elapsed_ms = pdTICKS_TO_MS(current_ticks - dosing_start_time);
+            
+            if (elapsed_ms < DOSING_RAMP_DURATION_MS) {
+                // Calculate ramped speed: linear interpolation from 5% to 3%
+                // speed = start + (target - start) * (elapsed / duration)
+                float ramp_progress = (float)elapsed_ms / (float)DOSING_RAMP_DURATION_MS;
+                uint8_t current_speed = DOSING_START_SPEED - 
+                    (uint8_t)((DOSING_START_SPEED - DOSING_TARGET_SPEED) * ramp_progress);
+                
+                motor_auger_set_speed(current_speed);
+                ESP_LOGD(TAG_NAU7802, "Dosing ramp: %lums elapsed, %d%% speed", elapsed_ms, current_speed);
+            } else {
+                // Ramp complete, maintain target speed
+                motor_auger_set_speed(DOSING_TARGET_SPEED);
+            }
+        }
+
         // Task delay between complete dual-channel cycles
         vTaskDelay(pdMS_TO_TICKS(NAU7802_POLL_RATE_MS));
     }
@@ -709,12 +737,15 @@ static esp_err_t nau7802_read_adc_raw(int32_t* raw_value)
     
     // Combine bytes into 24-bit signed value
     int32_t result = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | (int32_t)data[2];
-    
+
     // Sign extend from 24-bit to 32-bit
     if (result & 0x800000) {
         result |= 0xFF000000;
     }
     
+    // Log raw bytes and then converted value for debugging
+    ESP_LOGD(TAG_NAU7802, "ADC Raw Bytes: 0x%02X 0x%02X 0x%02X => Raw Value: %ld", data[0], data[1], data[2], result);
+
     *raw_value = result;
     return ESP_OK;
 }
@@ -879,12 +910,10 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
     (void)position;  // Unused parameter
     (void)delta;     // Unused parameter
     
-    static bool dosing_active = false;  // Track if we're currently dosing
-    
     // NEW BUTTON MAPPING:
     // Single Click = Reset encoder position (dosage setting)
     // Double Click = Tare scales
-    // Long Press = Dosing (run auger at 10% while held)
+    // Long Press = Dosing (run auger starting at 5%, ramping to 3% while held)
     
     if (event == ROTARY_EVENT_BUTTON_RELEASE) {
         // Button released after short press
@@ -962,11 +991,17 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         }
         
     } else if (event == ROTARY_EVENT_LONG_PRESS) {
-        // Long press - Start dosing (auger at 10%)
-        ESP_LOGI(TAG_NAU7802, "Long press detected - starting dosing (auger at 10%%)");
+        // Long press - Start dosing (auger starts at 5%, ramps to 3%)
+        ESP_LOGI(TAG_NAU7802, "Long press detected - starting dosing (5%% -> 3%% ramp)");
         display_send_system_status("Dosing...", false, 0);  // Indefinite display
-        motor_auger_set_speed(10);  // 10% speed
+        
+        // Start at 5% for reliable motor startup
+        motor_auger_set_speed(DOSING_START_SPEED);
         dosing_active = true;
+        dosing_start_time = xTaskGetTickCount();
+        
+        ESP_LOGI(TAG_NAU7802, "Dosing started at %d%% (will ramp to %d%% over %dms)", 
+                 DOSING_START_SPEED, DOSING_TARGET_SPEED, DOSING_RAMP_DURATION_MS);
         
         /* COMMENTED OUT - Calibration now done via UART console command
         // Long press - Calibrate with 358.2g weight
@@ -1182,10 +1217,11 @@ static esp_err_t nau7802_load_calibration_values(void)
 
     // Load Channel A scale factor
     size_t required_size = sizeof(float);
-    ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_A, &channel_a_cal.scale_factor, &required_size);
+    // ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_A, &channel_a_cal.scale_factor, &required_size);
+    ret = ESP_ERR_NVS_NOT_FOUND;
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG_NAU7802, "No saved Channel A scale factor found, using default (10.44)");
-        channel_a_cal.scale_factor = 10.44f;
+        channel_a_cal.scale_factor = -10.44f; 
         channel_a_cal.is_calibrated = false;
     } else if (ret != ESP_OK) {
         ESP_LOGW(TAG_NAU7802, "Failed to load Channel A scale factor: %s", esp_err_to_name(ret));
@@ -1198,7 +1234,8 @@ static esp_err_t nau7802_load_calibration_values(void)
 
     // Load Channel B scale factor
     required_size = sizeof(float);
-    ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_B, &channel_b_cal.scale_factor, &required_size);
+    // ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_B, &channel_b_cal.scale_factor, &required_size);
+    ret = ESP_ERR_NVS_NOT_FOUND;
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG_NAU7802, "No saved Channel B scale factor found, using default (10.44)");
         channel_b_cal.scale_factor = 10.44f;
@@ -1373,40 +1410,64 @@ esp_err_t nau7802_calibrate_channel(nau7802_channel_t channel, float known_weigh
         return ESP_ERR_INVALID_ARG;
     }
     
+    // Check if the target channel is connected
+    bool channel_connected = (channel == NAU7802_CHANNEL_1) ? channel_a_connected : channel_b_connected;
+    if (!channel_connected) {
+        ESP_LOGE(TAG_NAU7802, "Channel %d is not connected - cannot calibrate", channel);
+        display_send_system_status("Ch Disconnected!", true, 2000);
+        return ESP_ERR_INVALID_STATE;
+    }
+    
     // Show calibration message
     char msg[32];
     snprintf(msg, sizeof(msg), "Calibrating %.1fg", known_weight_grams);
     display_send_system_status(msg, false, 0);  // Indefinite
     
-    // Wait for physical stability
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Wait for physical stability and let user place weight
+    ESP_LOGI(TAG_NAU7802, "Waiting 1 second for weight placement and stability...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
     nau7802_calibration_t* cal = (channel == NAU7802_CHANNEL_1) ? &channel_a_cal : &channel_b_cal;
     
-    // Collect multiple readings for stable calibration
-    const int num_samples = 20;  // 20 samples over 1 second
+    // Collect multiple RAW readings from the global data structure
+    // The main task is already reading the sensor - we just sample those results
+    const int num_samples = 20;  // 20 samples over 2 seconds (100ms poll rate)
     int32_t cal_samples[num_samples];
     int valid_samples = 0;
     
+    ESP_LOGI(TAG_NAU7802, "Collecting %d calibration samples from global data...", num_samples);
+    
     for (int i = 0; i < num_samples; i++) {
-        esp_err_t ret = nau7802_select_channel(channel);
-        if (ret == ESP_OK) {
-            ret = nau7802_wait_for_data_ready(100);
-            if (ret == ESP_OK) {
-                int32_t raw_value;
-                ret = nau7802_read_adc_raw(&raw_value);
-                if (ret == ESP_OK) {
-                    cal_samples[valid_samples] = raw_value;
-                    valid_samples++;
-                    ESP_LOGI(TAG_NAU7802, "Cal sample %d: %ld", valid_samples, raw_value);
-                }
+        // Read the RAW value from the global structure (updated by main task)
+        if (xSemaphoreTake(nau7802_data_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            int32_t raw_value;
+            if (channel == NAU7802_CHANNEL_1) {
+                raw_value = nau7802_data.channel_a.raw_value;
+            } else {
+                raw_value = nau7802_data.channel_b.raw_value;
             }
+            xSemaphoreGive(nau7802_data_mutex);
+            
+            // Sanity check: reject obviously corrupted values
+            // Valid 24-bit signed range: -8388608 to 8388607
+            // But we expect typical readings to be within ±1,000,000 for our setup
+            if (raw_value > -5000000 && raw_value < 5000000) {
+                cal_samples[valid_samples] = raw_value;
+                valid_samples++;
+                ESP_LOGI(TAG_NAU7802, "Cal sample %d: %ld", valid_samples, raw_value);
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Rejected invalid sample %d: %ld (out of range)", i+1, raw_value);
+            }
+        } else {
+            ESP_LOGW(TAG_NAU7802, "Failed to acquire mutex for sample %d", i+1);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        // Wait for next reading from main task (100ms poll rate)
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     
-    if (valid_samples < 5) {
-        ESP_LOGE(TAG_NAU7802, "Insufficient samples for calibration (%d/20)", valid_samples);
+    if (valid_samples < 10) {
+        ESP_LOGE(TAG_NAU7802, "Insufficient valid samples for calibration (%d/20)", valid_samples);
         display_send_system_status("Cal Failed!", true, 2000);
         return ESP_ERR_TIMEOUT;
     }
@@ -1423,6 +1484,12 @@ esp_err_t nau7802_calibrate_channel(nau7802_channel_t channel, float known_weigh
     // Calculate new scale factor
     // scale_factor = (raw_value - zero_offset) / known_weight
     int32_t reading_above_tare = averaged_reading - cal->zero_offset;
+    
+    if (reading_above_tare == 0) {
+        ESP_LOGE(TAG_NAU7802, "Reading equals tare value - no weight detected!");
+        display_send_system_status("No Weight!", true, 2000);
+        return ESP_ERR_INVALID_STATE;
+    }
     
     float new_scale_factor = (float)reading_above_tare / known_weight_grams;
     

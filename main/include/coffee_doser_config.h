@@ -8,7 +8,7 @@
 #ifndef COFFEE_DOSER_CONFIG_H
 #define COFFEE_DOSER_CONFIG_H
 
-// Hardware Pin Definitions
+// Hardware Pin Definitions - System
 #define NEOPIXEL_GPIO           9       // NeoPixel on Adafruit ESP32-C6 Feather
 #define I2C_SDA_GPIO            19      // I2C SDA pin (official ESP32-C6 Feather pinout)
 #define I2C_SCL_GPIO            18      // I2C SCL pin (official ESP32-C6 Feather pinout)
@@ -23,6 +23,13 @@
 
 // Motor Driver (to be implemented later)
 // #define MOTOR_DRIVER_ADDR       0x60    // PCA9685 Motor driver for servo and stepper
+
+// Motor Controller Selection
+// Comment/uncomment to switch between motor controller implementations
+// PCA9685: I2C-based, 16 channels, 1526 Hz max (audible whine), shared I2C bus
+// TB6612FNG: Direct GPIO, 2 motors, 25 kHz (silent), no I2C overhead
+// #define USE_PCA9685_MOTOR_DRIVER    1   // Use PCA9685 I2C PWM controller (Adafruit Motor FeatherWing)
+#define USE_TB6612_MOTOR_DRIVER  1   // Use TB6612FNG dual H-bridge (Pololu #713) with 25 kHz PWM
 
 // NAU7802 Channel Definitions
 #define NAU7802_CHANNEL_A       1       // Container weight (strain gauge on container)
