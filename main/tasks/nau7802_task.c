@@ -879,26 +879,44 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
     (void)position;  // Unused parameter
     (void)delta;     // Unused parameter
     
+    static bool dosing_active = false;  // Track if we're currently dosing
+    
     // NEW BUTTON MAPPING:
     // Single Click = Reset encoder position (dosage setting)
     // Double Click = Tare scales
-    // Long Press = Calibrate with 358.2g weight
+    // Long Press = Dosing (run auger at 10% while held)
     
     if (event == ROTARY_EVENT_BUTTON_RELEASE) {
-        // Single click - Reset encoder position to 0 (for dosage weight setting)
-        ESP_LOGI(TAG_NAU7802, "Single click detected - resetting encoder position to 0");
+        // Button released after short press
         
-        esp_err_t encoder_ret = rotary_encoder_set_position(0);
-        if (encoder_ret == ESP_OK) {
-            ESP_LOGI(TAG_NAU7802, "Encoder position reset to 0g (dosage cleared)");
-            display_send_system_status("Dosage Reset", false, 1000);
+        // If we were dosing, stop the auger
+        if (dosing_active) {
+            ESP_LOGI(TAG_NAU7802, "Button released - stopping auger");
+            motor_auger_set_speed(0);
+            display_send_system_status("Dose Complete", false, 1000);
+            dosing_active = false;
         } else {
-            ESP_LOGW(TAG_NAU7802, "Failed to reset encoder position: %s", esp_err_to_name(encoder_ret));
+            // Regular single click - Reset encoder position to 0 (for dosage weight setting)
+            ESP_LOGI(TAG_NAU7802, "Single click detected - resetting encoder position to 0");
+            
+            esp_err_t encoder_ret = rotary_encoder_set_position(0);
+            if (encoder_ret == ESP_OK) {
+                ESP_LOGI(TAG_NAU7802, "Encoder position reset to 0g (dosage cleared)");
+                display_send_system_status("Dosage Reset", false, 1000);
+            } else {
+                ESP_LOGW(TAG_NAU7802, "Failed to reset encoder position: %s", esp_err_to_name(encoder_ret));
+            }
         }
         
     } else if (event == ROTARY_EVENT_DOUBLE_CLICK) {
         // Double click - Tare scales
         ESP_LOGI(TAG_NAU7802, "Double-click detected - taring scales...");
+        
+        // Stop dosing if active
+        if (dosing_active) {
+            motor_auger_set_speed(0);
+            dosing_active = false;
+        }
         
         bool any_tared = false;
         
@@ -944,6 +962,13 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         }
         
     } else if (event == ROTARY_EVENT_LONG_PRESS) {
+        // Long press - Start dosing (auger at 10%)
+        ESP_LOGI(TAG_NAU7802, "Long press detected - starting dosing (auger at 10%%)");
+        display_send_system_status("Dosing...", false, 0);  // Indefinite display
+        motor_auger_set_speed(10);  // 10% speed
+        dosing_active = true;
+        
+        /* COMMENTED OUT - Calibration now done via UART console command
         // Long press - Calibrate with 358.2g weight
         ESP_LOGI(TAG_NAU7802, "Long press detected - starting calibration with 358.2g weight");
         display_send_system_status("358.2g -> Ch A", false, 2000);
@@ -999,6 +1024,7 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         // Show completion message
         display_send_system_status("Cal Complete!", false, 2000);
         ESP_LOGI(TAG_NAU7802, "Calibration sequence complete");
+        */
     }
 }
 

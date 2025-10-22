@@ -1,8 +1,8 @@
 /*
- * Motor Control Task - PCA9685 PWM Motor Controller
+ * Motor Control Task - Application Layer
  * 
- * Controls DC motors and air pump via Adafruit Motor FeatherWing
- * Uses PCA9685 I2C PWM controller with TB6612 motor drivers
+ * Controls DC motors and air pump via hardware abstraction layer
+ * Hardware-agnostic motor control for coffee bean dispensing
  */
 
 #ifndef MOTOR_CONTROL_TASK_H
@@ -11,71 +11,22 @@
 #include "esp_err.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include "pca9685_driver.h"
 
 // Logging tag
 #define TAG_MOTOR "MOTOR_CTRL"
 
-// PCA9685 I2C Address (default, can be modified with address jumpers)
-#define PCA9685_I2C_ADDRESS         0x60
+// Motor Performance Parameters
+#define MOTOR_MIN_SPEED_PERCENT     10      // Minimum speed to overcome static friction
 
-// PCA9685 Register Definitions
-#define PCA9685_REG_MODE1           0x00    // Mode register 1
-#define PCA9685_REG_MODE2           0x01    // Mode register 2
-#define PCA9685_REG_SUBADR1         0x02    // I2C subaddress 1
-#define PCA9685_REG_SUBADR2         0x03    // I2C subaddress 2
-#define PCA9685_REG_SUBADR3         0x04    // I2C subaddress 3
-#define PCA9685_REG_ALLCALLADR      0x05    // All call address
-#define PCA9685_REG_LED0_ON_L       0x06    // LED0 output ON time, low byte
-#define PCA9685_REG_LED0_ON_H       0x07    // LED0 output ON time, high byte
-#define PCA9685_REG_LED0_OFF_L      0x08    // LED0 output OFF time, low byte
-#define PCA9685_REG_LED0_OFF_H      0x09    // LED0 output OFF time, high byte
-#define PCA9685_REG_ALL_LED_ON_L    0xFA    // All LED ON time, low byte
-#define PCA9685_REG_ALL_LED_ON_H    0xFB    // All LED ON time, high byte
-#define PCA9685_REG_ALL_LED_OFF_L   0xFC    // All LED OFF time, low byte
-#define PCA9685_REG_ALL_LED_OFF_H   0xFD    // All LED OFF time, high byte
-#define PCA9685_REG_PRESCALE        0xFE    // Prescaler for PWM output frequency
-#define PCA9685_REG_TESTMODE        0xFF    // Test mode register
+// Motor Assignment Macros (for readability)
+#define MOTOR_AUGER_PWM             MOTOR_M1_PWM
+#define MOTOR_AUGER_IN1             MOTOR_M1_IN1
+#define MOTOR_AUGER_IN2             MOTOR_M1_IN2
 
-// PCA9685 Mode1 Register Bits
-#define PCA9685_MODE1_RESTART       0x80    // Restart enabled
-#define PCA9685_MODE1_EXTCLK        0x40    // Use external clock
-#define PCA9685_MODE1_AI            0x20    // Auto-increment enabled
-#define PCA9685_MODE1_SLEEP         0x10    // Low power mode (oscillator off)
-#define PCA9685_MODE1_SUB1          0x08    // Respond to I2C subaddress 1
-#define PCA9685_MODE1_SUB2          0x04    // Respond to I2C subaddress 2
-#define PCA9685_MODE1_SUB3          0x02    // Respond to I2C subaddress 3
-#define PCA9685_MODE1_ALLCALL       0x01    // Respond to all call I2C address
-
-// PCA9685 Mode2 Register Bits
-#define PCA9685_MODE2_INVRT         0x10    // Invert output logic
-#define PCA9685_MODE2_OCH           0x08    // Outputs change on STOP vs ACK
-#define PCA9685_MODE2_OUTDRV        0x04    // Totem pole vs open-drain
-#define PCA9685_MODE2_OUTNE1        0x02    // Output enable mode bit 1
-#define PCA9685_MODE2_OUTNE0        0x01    // Output enable mode bit 0
-
-// PWM Constants
-#define PCA9685_PWM_FREQUENCY       1526    // Maximum PWM frequency in Hz (prescale=3)
-#define PCA9685_CLOCK_FREQ          25000000  // Internal oscillator frequency (25 MHz)
-#define PCA9685_PWM_RESOLUTION      4096    // 12-bit PWM resolution
-
-
-#define MOTOR_MIN_SPEED_PERCENT     10     
-
-// Motor Channel Definitions (per Adafruit Motor Shield V2 mapping)
-// DC Motors: M1 (air pump), M2 (auger motor), M3, M4
-#define MOTOR_M1_PWM                8       // Motor 1 PWM pin on PCA9685 (AIR PUMP)
-#define MOTOR_M1_IN2                9       // Motor 1 IN2 pin
-#define MOTOR_M1_IN1                10      // Motor 1 IN1 pin
-#define MOTOR_M2_PWM                13      // Motor 2 PWM pin (AUGER MOTOR)
-#define MOTOR_M2_IN2                12      // Motor 2 IN2 pin
-#define MOTOR_M2_IN1                11      // Motor 2 IN1 pin
-
-#define MOTOR_M3_PWM                2       // Motor 3 PWM pin (unused)
-#define MOTOR_M3_IN2                3       // Motor 3 IN2 pin
-#define MOTOR_M3_IN1                4       // Motor 3 IN1 pin
-#define MOTOR_M4_PWM                7       // Motor 4 PWM pin (unused)
-#define MOTOR_M4_IN2                6       // Motor 4 IN2 pin
-#define MOTOR_M4_IN1                5       // Motor 4 IN1 pin
+#define MOTOR_AIR_PUMP_PWM          MOTOR_M2_PWM
+#define MOTOR_AIR_PUMP_IN1          MOTOR_M2_IN1
+#define MOTOR_AIR_PUMP_IN2          MOTOR_M2_IN2
 
 // Task Configuration
 #define MOTOR_TASK_STACK_SIZE       4096
@@ -107,7 +58,7 @@ typedef struct {
 /**
  * @brief Initialize motor control task
  * 
- * Sets up I2C communication with PCA9685 and starts the motor control task
+ * Sets up hardware PWM controller and starts the motor control task
  * 
  * @return ESP_OK on success, error code otherwise
  */
@@ -131,16 +82,16 @@ esp_err_t motor_control_task_deinit(void);
 esp_err_t motor_get_state(motor_state_t* state);
 
 /**
- * @brief Set PWM value for a specific PCA9685 channel
+ * @brief Set PWM value for a specific channel (hardware abstraction)
  * 
- * @param channel PWM channel (0-15)
+ * @param channel PWM channel (hardware-specific)
  * @param value PWM value (0-4095, 12-bit). Use 4095 for digital HIGH, 0 for LOW
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t motor_set_pwm(uint8_t channel, uint16_t value);
 
 /**
- * @brief Control air pump on M1 with PWM speed control
+ * @brief Control air pump with PWM speed control
  * 
  * @param speed_percent Speed as percentage (0-100). 0 = off, 100 = full speed
  * @return ESP_OK on success, error code otherwise
@@ -148,7 +99,7 @@ esp_err_t motor_set_pwm(uint8_t channel, uint16_t value);
 esp_err_t motor_air_pump_set_speed(uint8_t speed_percent);
 
 /**
- * @brief Control auger motor on M2 with PWM speed control
+ * @brief Control auger motor with PWM speed control
  * 
  * @param speed_percent Speed as percentage (0-100). 0 = off, 100 = full speed
  * @return ESP_OK on success, error code otherwise
