@@ -51,9 +51,9 @@ static volatile bool tare_in_progress = false;  // Flag to indicate tare operati
 // Dosing motor control
 static bool dosing_active = false;              // Track if we're currently dosing
 static TickType_t dosing_start_time = 0;        // When dosing started
-#define DOSING_RAMP_DURATION_MS  250            // Ramp from 5% to 3% over 1 second
+#define DOSING_RAMP_DURATION_MS  250            // Ramp from 5% to 4% over 1 second
 #define DOSING_START_SPEED       5               // Start at 5% (reliable startup)
-#define DOSING_TARGET_SPEED      3               // Target 3% (minimum steady speed)
+#define DOSING_TARGET_SPEED      4               // Target 4% (minimum steady speed)
 
 // I2C device handle
 static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
@@ -725,28 +725,34 @@ static esp_err_t nau7802_read_adc_raw(int32_t* raw_value)
 {
     uint8_t data[3];
     
-    // Read 3 bytes of ADC data
-    esp_err_t ret = nau7802_read_register(NAU7802_REG_ADCO_B2, &data[0]);
-    if (ret != ESP_OK) return ret;
+    // Read all 3 ADC bytes in a single I2C burst transaction
+    // This is faster and more atomic than 3 separate register reads
+    // The NAU7802 auto-increments the register address after each byte
+    esp_err_t ret = i2c_master_transmit(nau7802_i2c_dev_handle, (uint8_t[]){NAU7802_REG_ADCO_B2}, 1, 1000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to transmit ADC register address: %s", esp_err_to_name(ret));
+        return ret;
+    }
     
-    ret = nau7802_read_register(NAU7802_REG_ADCO_B1, &data[1]);
-    if (ret != ESP_OK) return ret;
+    ret = i2c_master_receive(nau7802_i2c_dev_handle, data, 3, 1000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_NAU7802, "Failed to receive ADC data: %s", esp_err_to_name(ret));
+        return ret;
+    }
     
-    ret = nau7802_read_register(NAU7802_REG_ADCO_B0, &data[2]);
-    if (ret != ESP_OK) return ret;
+    // Combine 3 bytes into 24-bit value (MSB first)
+    uint32_t result = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | (uint32_t)data[2];
     
-    // Combine bytes into 24-bit signed value
-    int32_t result = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | (int32_t)data[2];
-
     // Sign extend from 24-bit to 32-bit
     if (result & 0x800000) {
         result |= 0xFF000000;
     }
     
-    // Log raw bytes and then converted value for debugging
-    ESP_LOGD(TAG_NAU7802, "ADC Raw Bytes: 0x%02X 0x%02X 0x%02X => Raw Value: %ld", data[0], data[1], data[2], result);
+    // Log raw bytes and converted value for debugging
+    ESP_LOGD(TAG_NAU7802, "ADC Raw Bytes: 0x%02X 0x%02X 0x%02X => Raw Value: %ld", 
+             data[0], data[1], data[2], (int32_t)result);
 
-    *raw_value = result;
+    *raw_value = (int32_t)result;
     return ESP_OK;
 }
 
@@ -1002,64 +1008,6 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         
         ESP_LOGI(TAG_NAU7802, "Dosing started at %d%% (will ramp to %d%% over %dms)", 
                  DOSING_START_SPEED, DOSING_TARGET_SPEED, DOSING_RAMP_DURATION_MS);
-        
-        /* COMMENTED OUT - Calibration now done via UART console command
-        // Long press - Calibrate with 358.2g weight
-        ESP_LOGI(TAG_NAU7802, "Long press detected - starting calibration with 358.2g weight");
-        display_send_system_status("358.2g -> Ch A", false, 2000);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        // Calibrate Channel A (Container)
-        if (channel_a_connected) {
-            // Show instruction to move weight and press button when ready
-            display_send_system_status("Move to Ch A - 5", false, 1000); 
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Move to Ch A - 4", false, 1000); 
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Move to Ch A - 3", false, 1000); 
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Move to Ch A - 2", false, 1000);
-            vTaskDelay(pdMS_TO_TICKS(1000));    
-            display_send_system_status("Move to Ch A - 1", false, 1000);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Cal Ch A...", false, 0);  // Indefinite
-            
-            esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_1, 358.2f);
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG_NAU7802, "Channel A calibrated with 358.2g weight");
-            } else {
-                ESP_LOGW(TAG_NAU7802, "Failed to calibrate Channel A: %s", esp_err_to_name(ret));
-            }
-        }
-        
-        // Calibrate Channel B if connected - wait for user confirmation
-        if (channel_b_connected) {
-            // Show instruction to move weight and press button when ready
-            display_send_system_status("Move to Ch B - 5", false, 1000); 
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Move to Ch B - 4", false, 1000); 
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Move to Ch B - 3", false, 1000); 
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Move to Ch B - 2", false, 1000);
-            vTaskDelay(pdMS_TO_TICKS(1000));    
-            display_send_system_status("Move to Ch B - 1", false, 1000);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            display_send_system_status("Cal Ch B...", false, 0);  // Indefinite
-
-            // Now calibrate Channel B
-            esp_err_t ret = nau7802_calibrate_channel(NAU7802_CHANNEL_2, 358.2f);
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG_NAU7802, "Channel B calibrated with 358.2g weight");
-            } else {
-                ESP_LOGW(TAG_NAU7802, "Failed to calibrate Channel B: %s", esp_err_to_name(ret));
-            }
-        }
-        
-        // Show completion message
-        display_send_system_status("Cal Complete!", false, 2000);
-        ESP_LOGI(TAG_NAU7802, "Calibration sequence complete");
-        */
     }
 }
 
@@ -1217,10 +1165,9 @@ static esp_err_t nau7802_load_calibration_values(void)
 
     // Load Channel A scale factor
     size_t required_size = sizeof(float);
-    // ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_A, &channel_a_cal.scale_factor, &required_size);
-    ret = ESP_ERR_NVS_NOT_FOUND;
+    ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_A, &channel_a_cal.scale_factor, &required_size);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG_NAU7802, "No saved Channel A scale factor found, using default (10.44)");
+        ESP_LOGI(TAG_NAU7802, "No saved Channel A scale factor found, using default (-10.44)");
         channel_a_cal.scale_factor = -10.44f; 
         channel_a_cal.is_calibrated = false;
     } else if (ret != ESP_OK) {
@@ -1234,8 +1181,7 @@ static esp_err_t nau7802_load_calibration_values(void)
 
     // Load Channel B scale factor
     required_size = sizeof(float);
-    // ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_B, &channel_b_cal.scale_factor, &required_size);
-    ret = ESP_ERR_NVS_NOT_FOUND;
+    ret = nvs_get_blob(nvs_handle, NVS_KEY_SCALE_B, &channel_b_cal.scale_factor, &required_size);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG_NAU7802, "No saved Channel B scale factor found, using default (10.44)");
         channel_b_cal.scale_factor = 10.44f;
