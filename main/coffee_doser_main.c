@@ -25,6 +25,7 @@
 #include "nau7802_task.h"
 #include "motor_control_task.h"
 #include "console_task.h"
+#include "servo_driver.h"
 
 static void initialize_system(void)
 {
@@ -89,6 +90,13 @@ static void initialize_peripherals(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_MAIN, "Failed to initialize motor control task: %s", esp_err_to_name(ret));
         return;
+    }
+    
+    // Initialize servo driver
+    ret = servo_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "Failed to initialize servo driver: %s", esp_err_to_name(ret));
+        // Non-fatal, continue without servo
     }
     
     // Initialize console task for development/debugging

@@ -51,9 +51,14 @@ static volatile bool tare_in_progress = false;  // Flag to indicate tare operati
 // Dosing motor control
 static bool dosing_active = false;              // Track if we're currently dosing
 static TickType_t dosing_start_time = 0;        // When dosing started
+static uint8_t current_dosing_speed = 5;        // Current dosing speed (adjustable by encoder)
+static bool manual_speed_control = false;       // Track if user has manually adjusted speed
 #define DOSING_RAMP_DURATION_MS  250            // Ramp from 5% to 4% over 1 second
 #define DOSING_START_SPEED       5               // Start at 5% (reliable startup)
 #define DOSING_TARGET_SPEED      4               // Target 4% (minimum steady speed)
+#define DOSING_MIN_SPEED         3               // Minimum speed (motor stall limit)
+#define DOSING_MAX_SPEED         10              // Maximum speed (safety limit)
+#define DOSING_SPEED_INCREMENT   1               // Speed change per encoder click (%)
 
 // I2C device handle
 static i2c_master_dev_handle_t nau7802_i2c_dev_handle = NULL;
@@ -500,23 +505,25 @@ static void nau7802_task_function(void* pvParameters)
         }
 
         // ==================== Dosing Motor Ramp-Down ====================
-        // If dosing is active, gradually ramp speed from 5% to 3%
-        if (dosing_active) {
+        // If dosing is active and user hasn't manually adjusted speed, gradually ramp speed from 5% to 4%
+        if (dosing_active && !manual_speed_control) {
             TickType_t current_ticks = xTaskGetTickCount();
             uint32_t elapsed_ms = pdTICKS_TO_MS(current_ticks - dosing_start_time);
             
             if (elapsed_ms < DOSING_RAMP_DURATION_MS) {
-                // Calculate ramped speed: linear interpolation from 5% to 3%
+                // Calculate ramped speed: linear interpolation from 5% to 4%
                 // speed = start + (target - start) * (elapsed / duration)
                 float ramp_progress = (float)elapsed_ms / (float)DOSING_RAMP_DURATION_MS;
-                uint8_t current_speed = DOSING_START_SPEED - 
+                uint8_t ramped_speed = DOSING_START_SPEED - 
                     (uint8_t)((DOSING_START_SPEED - DOSING_TARGET_SPEED) * ramp_progress);
                 
-                motor_auger_set_speed(current_speed);
-                ESP_LOGD(TAG_NAU7802, "Dosing ramp: %lums elapsed, %d%% speed", elapsed_ms, current_speed);
+                current_dosing_speed = ramped_speed;  // Update current speed
+                motor_auger_set_speed(current_dosing_speed);
+                ESP_LOGD(TAG_NAU7802, "Dosing ramp: %lums elapsed, %d%% speed", elapsed_ms, current_dosing_speed);
             } else {
                 // Ramp complete, maintain target speed
-                motor_auger_set_speed(DOSING_TARGET_SPEED);
+                current_dosing_speed = DOSING_TARGET_SPEED;
+                motor_auger_set_speed(current_dosing_speed);
             }
         }
 
@@ -926,10 +933,11 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         
         // If we were dosing, stop the auger
         if (dosing_active) {
-            ESP_LOGI(TAG_NAU7802, "Button released - stopping auger");
+            ESP_LOGI(TAG_NAU7802, "Button released - stopping auger at %d%% (will use this speed next time)", current_dosing_speed);
             motor_auger_set_speed(0);
             display_send_system_status("Dose Complete", false, 1000);
             dosing_active = false;
+            // Keep manual_speed_control and current_dosing_speed for next session
         } else {
             // Regular single click - Reset encoder position to 0 (for dosage weight setting)
             ESP_LOGI(TAG_NAU7802, "Single click detected - resetting encoder position to 0");
@@ -947,10 +955,11 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         // Double click - Tare scales
         ESP_LOGI(TAG_NAU7802, "Double-click detected - taring scales...");
         
-        // Stop dosing if active
+        // Stop dosing if active (but keep speed settings for next dose)
         if (dosing_active) {
             motor_auger_set_speed(0);
             dosing_active = false;
+            // Keep manual_speed_control and current_dosing_speed
         }
         
         bool any_tared = false;
@@ -997,17 +1006,69 @@ static void nau7802_rotary_event_handler(rotary_event_t event, int32_t position,
         }
         
     } else if (event == ROTARY_EVENT_LONG_PRESS) {
-        // Long press - Start dosing (auger starts at 5%, ramps to 3%)
-        ESP_LOGI(TAG_NAU7802, "Long press detected - starting dosing (5%% -> 3%% ramp)");
+        // Long press - Start dosing (uses last set speed, or ramps if never manually set)
+        ESP_LOGI(TAG_NAU7802, "Long press detected - starting dosing at %d%%", current_dosing_speed);
         display_send_system_status("Dosing...", false, 0);  // Indefinite display
         
-        // Start at 5% for reliable motor startup
-        motor_auger_set_speed(DOSING_START_SPEED);
+        // Initialize dosing state (keep current_dosing_speed from previous session)
         dosing_active = true;
         dosing_start_time = xTaskGetTickCount();
         
-        ESP_LOGI(TAG_NAU7802, "Dosing started at %d%% (will ramp to %d%% over %dms)", 
-                 DOSING_START_SPEED, DOSING_TARGET_SPEED, DOSING_RAMP_DURATION_MS);
+        // Start motor at saved speed
+        motor_auger_set_speed(current_dosing_speed);
+        
+        if (manual_speed_control) {
+            // User previously set a manual speed, use it directly
+            ESP_LOGI(TAG_NAU7802, "Dosing started at user-set speed: %d%%", current_dosing_speed);
+        } else {
+            // First time or after reset, will ramp from 5% to 4%
+            ESP_LOGI(TAG_NAU7802, "Dosing started at %d%% (will ramp to %d%% over %dms)", 
+                     DOSING_START_SPEED, DOSING_TARGET_SPEED, DOSING_RAMP_DURATION_MS);
+        }
+    
+    } else if (event == ROTARY_EVENT_CLOCKWISE) {
+        // Encoder rotated clockwise
+        if (dosing_active) {
+            // Increase dosing speed while button held
+            if (current_dosing_speed < DOSING_MAX_SPEED) {
+                manual_speed_control = true;  // User has taken manual control
+                current_dosing_speed += DOSING_SPEED_INCREMENT;
+                if (current_dosing_speed > DOSING_MAX_SPEED) {
+                    current_dosing_speed = DOSING_MAX_SPEED;
+                }
+                motor_auger_set_speed(current_dosing_speed);
+                ESP_LOGI(TAG_NAU7802, "Dosing speed increased to %d%%", current_dosing_speed);
+                
+                // Update display to show current speed
+                char speed_msg[32];
+                snprintf(speed_msg, sizeof(speed_msg), "Speed: %d%%", current_dosing_speed);
+                display_send_system_status(speed_msg, false, 500);
+            } else {
+                ESP_LOGD(TAG_NAU7802, "Dosing speed already at maximum (%d%%)", DOSING_MAX_SPEED);
+            }
+        }
+    
+    } else if (event == ROTARY_EVENT_COUNTERCLOCKWISE) {
+        // Encoder rotated counterclockwise
+        if (dosing_active) {
+            // Decrease dosing speed while button held
+            if (current_dosing_speed > DOSING_MIN_SPEED) {
+                manual_speed_control = true;  // User has taken manual control
+                current_dosing_speed -= DOSING_SPEED_INCREMENT;
+                if (current_dosing_speed < DOSING_MIN_SPEED) {
+                    current_dosing_speed = DOSING_MIN_SPEED;
+                }
+                motor_auger_set_speed(current_dosing_speed);
+                ESP_LOGI(TAG_NAU7802, "Dosing speed decreased to %d%%", current_dosing_speed);
+                
+                // Update display to show current speed
+                char speed_msg[32];
+                snprintf(speed_msg, sizeof(speed_msg), "Speed: %d%%", current_dosing_speed);
+                display_send_system_status(speed_msg, false, 500);
+            } else {
+                ESP_LOGD(TAG_NAU7802, "Dosing speed already at minimum (%d%%)", DOSING_MIN_SPEED);
+            }
+        }
     }
 }
 

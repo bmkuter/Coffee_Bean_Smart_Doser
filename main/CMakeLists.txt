@@ -8,4 +8,5 @@ idf_component_register(SRCS "coffee_doser_main.c"
                             "hardware/shared_i2c_bus.c"
                             "hardware/pca9685_driver.c"
                             "hardware/tb6612_driver.c"
+                            "hardware/servo_driver.c"
                        INCLUDE_DIRS "." "include")

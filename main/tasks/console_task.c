@@ -9,6 +9,7 @@
 #include "nau7802_task.h"
 #include "rotary_encoder_task.h"
 #include "display_task.h"
+#include "servo_driver.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -49,6 +50,12 @@ static void cmd_calibrate(int argc, char **argv);
 static void cmd_weight(int argc, char **argv);
 static void cmd_status(int argc, char **argv);
 static void cmd_encoder(int argc, char **argv);
+static void cmd_servo(int argc, char **argv);
+static void cmd_servo_us(int argc, char **argv);
+static void cmd_servo_off(int argc, char **argv);
+static void cmd_servo_sweep(int argc, char **argv);
+static void cmd_servo_open(int argc, char **argv);
+static void cmd_servo_close(int argc, char **argv);
 
 // Built-in commands
 static const console_command_t builtin_commands[] = {
@@ -62,6 +69,12 @@ static const console_command_t builtin_commands[] = {
     {"weight", "Show current weight readings", cmd_weight},
     {"status", "Show system status", cmd_status},
     {"encoder", "encoder <position>  - Set encoder position", cmd_encoder},
+    {"servo", "servo <angle>  - Set servo angle (0-180°)", cmd_servo},
+    {"servo_us", "servo_us <us>  - Set servo pulse width (500-2500µs)", cmd_servo_us},
+    {"servo_off", "Disable servo PWM output", cmd_servo_off},
+    {"servo_sweep", "servo_sweep <start> <end> <time_ms> [repeats]  - Sweep servo", cmd_servo_sweep},
+    {"open", "Open servo to 32° (calibrated open position)", cmd_servo_open},
+    {"close", "Close servo to 87° (calibrated closed position)", cmd_servo_close},
 };
 
 #define NUM_BUILTIN_COMMANDS (sizeof(builtin_commands) / sizeof(console_command_t))
@@ -484,5 +497,212 @@ static void cmd_encoder(int argc, char **argv)
         console_printf("Encoder position set to %ld\r\n", position);
     } else {
         console_printf("Error setting encoder position: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_servo(int argc, char **argv)
+{
+    if (argc < 2) {
+        console_printf("Usage: servo <angle>\r\n");
+        console_printf("  angle: Servo angle in degrees (0-180)\r\n");
+        console_printf("Current: %d° (%d µs)\r\n", servo_get_angle(), servo_get_pulse_width());
+        return;
+    }
+    
+    int angle = atoi(argv[1]);
+    
+    if (angle < 0 || angle > 180) {
+        console_printf("Error: Angle must be 0-180°\r\n");
+        return;
+    }
+    
+    esp_err_t ret = servo_set_angle(angle);
+    if (ret == ESP_OK) {
+        console_printf("Servo set to %d° (%d µs)\r\n", angle, servo_get_pulse_width());
+    } else {
+        console_printf("Error setting servo angle: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_servo_us(int argc, char **argv)
+{
+    if (argc < 2) {
+        console_printf("Usage: servo_us <microseconds>\r\n");
+        console_printf("  microseconds: Pulse width (1000-2000µs)\r\n");
+        console_printf("Current: %d µs (%d°)\r\n", servo_get_pulse_width(), servo_get_angle());
+        return;
+    }
+    
+    int pulse_us = atoi(argv[1]);
+    
+    if (pulse_us < 1000 || pulse_us > 2000) {
+        console_printf("Error: Pulse width must be 1000-2000µs\r\n");
+        return;
+    }
+    
+    esp_err_t ret = servo_set_pulse_width(pulse_us);
+    if (ret == ESP_OK) {
+        console_printf("Servo set to %d µs (%d°)\r\n", pulse_us, servo_get_angle());
+    } else {
+        console_printf("Error setting servo pulse width: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_servo_off(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    
+    esp_err_t ret = servo_disable();
+    if (ret == ESP_OK) {
+        console_printf("Servo PWM disabled\r\n");
+    } else {
+        console_printf("Error disabling servo: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_servo_sweep(int argc, char **argv)
+{
+    if (argc < 4) {
+        console_printf("Usage: servo_sweep <start_angle> <end_angle> <time_ms> [repeats]\r\n");
+        console_printf("  start_angle: Starting angle (0-180°)\r\n");
+        console_printf("  end_angle:   Ending angle (0-180°)\r\n");
+        console_printf("  time_ms:     Total sweep time in milliseconds\r\n");
+        console_printf("  repeats:     Number of times to repeat (optional, default=1)\r\n");
+        console_printf("Example: servo_sweep 0 180 2000     (sweep once)\r\n");
+        console_printf("Example: servo_sweep 0 180 2000 5   (sweep 5 times)\r\n");
+        return;
+    }
+    
+    int start_angle = atoi(argv[1]);
+    int end_angle = atoi(argv[2]);
+    int total_time_ms = atoi(argv[3]);
+    int repeats = 1;  // Default to 1 repeat
+    
+    // Optional repeat count
+    if (argc >= 5) {
+        repeats = atoi(argv[4]);
+        if (repeats < 1) {
+            console_printf("Error: repeats must be at least 1\r\n");
+            return;
+        }
+        if (repeats > 100) {
+            console_printf("Error: repeats limited to 100 (safety)\r\n");
+            return;
+        }
+    }
+    
+    // Validate parameters
+    if (start_angle < 0 || start_angle > 180) {
+        console_printf("Error: start_angle must be 0-180°\r\n");
+        return;
+    }
+    if (end_angle < 0 || end_angle > 180) {
+        console_printf("Error: end_angle must be 0-180°\r\n");
+        return;
+    }
+    if (total_time_ms < 100) {
+        console_printf("Error: time_ms must be at least 100ms\r\n");
+        return;
+    }
+    
+    if (repeats == 1) {
+        console_printf("Sweeping servo: %d° → %d° → %d° over %dms\r\n", 
+                       start_angle, end_angle, start_angle, total_time_ms);
+    } else {
+        console_printf("Sweeping servo: %d° → %d° → %d° over %dms, repeating %d times\r\n", 
+                       start_angle, end_angle, start_angle, total_time_ms, repeats);
+    }
+    
+    // Calculate step parameters
+    int angle_range = abs(end_angle - start_angle);
+    int step_delay_ms = 20;  // Update every 20ms (50 Hz servo refresh rate)
+    int total_steps = total_time_ms / (2 * step_delay_ms);  // Divide by 2 for forward + backward
+    
+    if (total_steps < 1) {
+        total_steps = 1;
+    }
+    
+    float step_size = (float)angle_range / (float)total_steps;
+    
+    // Repeat the sweep operation
+    for (int repeat = 1; repeat <= repeats; repeat++) {
+        if (repeats > 1) {
+            console_printf("Sweep %d of %d\r\n", repeat, repeats);
+        }
+        
+        // Sweep forward: start → end
+        console_printf("  Sweeping forward...\r\n");
+        for (int step = 0; step <= total_steps; step++) {
+            float progress = (float)step / (float)total_steps;
+            int current_angle;
+            
+            if (end_angle > start_angle) {
+                current_angle = start_angle + (int)(progress * angle_range);
+            } else {
+                current_angle = start_angle - (int)(progress * angle_range);
+            }
+            
+            esp_err_t ret = servo_set_angle(current_angle);
+            if (ret != ESP_OK) {
+                console_printf("Error during sweep: %s\r\n", esp_err_to_name(ret));
+                return;
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(step_delay_ms));
+        }
+        
+        // Sweep backward: end → start
+        console_printf("  Sweeping backward...\r\n");
+        for (int step = 0; step <= total_steps; step++) {
+            float progress = (float)step / (float)total_steps;
+            int current_angle;
+            
+            if (end_angle > start_angle) {
+                current_angle = end_angle - (int)(progress * angle_range);
+            } else {
+                current_angle = end_angle + (int)(progress * angle_range);
+            }
+            
+            esp_err_t ret = servo_set_angle(current_angle);
+            if (ret != ESP_OK) {
+                console_printf("Error during sweep: %s\r\n", esp_err_to_name(ret));
+                return;
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(step_delay_ms));
+        }
+    }
+    
+    console_printf("Sweep complete (%d cycles). Servo at %d°\r\n", repeats, servo_get_angle());
+}
+
+static void cmd_servo_open(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    const uint8_t open_angle = SERVO_OPEN_ANGLE;  // Calibrated open position
+
+    esp_err_t ret = servo_set_angle(open_angle);
+    if (ret == ESP_OK) {
+        console_printf("Servo OPEN - moved to %d° (%d µs)\r\n", open_angle, servo_get_pulse_width());
+    } else {
+        console_printf("Error opening servo: %s\r\n", esp_err_to_name(ret));
+    }
+}
+
+static void cmd_servo_close(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    
+    const uint8_t close_angle = SERVO_CLOSE_ANGLE;  // Calibrated closed position
+
+    esp_err_t ret = servo_set_angle(close_angle);
+    if (ret == ESP_OK) {
+        console_printf("Servo CLOSED - moved to %d° (%d µs)\r\n", close_angle, servo_get_pulse_width());
+    } else {
+        console_printf("Error closing servo: %s\r\n", esp_err_to_name(ret));
     }
 }
